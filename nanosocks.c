@@ -56,17 +56,13 @@ struct ClientContext {
     size_t             remote_pollfd_idx;
 };
 
-static void client_ctx_init(struct ClientContext* ctx, int sock,
-                            size_t pollfd_idx) {
+static void client_ctx_init(struct ClientContext* ctx) {
     ctx->state = CLIENT_STATE_WAIT_GREET;
 
     ring_buffer_init(&ctx->in_queue, CLIENT_RING_BUFFER_SIZE);
     ring_buffer_init(&ctx->out_queue, CLIENT_RING_BUFFER_SIZE);
 
-    ctx->sock        = sock;
-    ctx->remote_sock = INVALID_SOCKFD;
-
-    ctx->pollfd_idx        = pollfd_idx;
+    ctx->remote_sock       = INVALID_SOCKFD;
     ctx->remote_pollfd_idx = INVALID_POLLFD;
 }
 
@@ -185,8 +181,7 @@ static void client_ctx_free(struct ClientContext* ctx) {
     ring_buffer_free(&ctx->out_queue);
 }
 
-static int client_ctx_on_recv(struct ClientContext* ctx, int sock,
-                              struct Vector*                pollfds,
+static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
                               struct AuthenticationContext* auth_ctx,
                               struct pollfd*                pollfd,
                               struct pollfd*                remote_pollfd) {
@@ -226,15 +221,15 @@ static int client_ctx_on_recv(struct ClientContext* ctx, int sock,
             ring_buffer_is_trivially_allocatable(&ctx->out_queue, to_read);
         if (is_trivially_allocatable) {
             // Recv directly to the ring buffer
-            read =
-                recv_all(sock, (char*)ctx->out_queue.data + ctx->out_queue.tail,
-                         to_read, 0);
+            read = recv_all(ctx->sock,
+                            (char*)ctx->out_queue.data + ctx->out_queue.tail,
+                            to_read, 0);
 
             if (read > 0)
                 ring_buffer_grow(&ctx->out_queue, read);
         } else {
             // Recv to the temp buffer
-            read = recv_all(sock, buffer, to_read, 0);
+            read = recv_all(ctx->sock, buffer, to_read, 0);
 
             // Fill ring buffer with temp buffer
             if (read > 0)
@@ -242,7 +237,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, int sock,
         }
     } else {
         // Use stack buffer
-        read = recv_all(sock, buffer, to_read, 0);
+        read = recv_all(ctx->sock, buffer, to_read, 0);
     }
 
     if (read < 0) {
@@ -563,13 +558,14 @@ static int client_ctx_on_recv(struct ClientContext* ctx, int sock,
         ctx->remote_sin.sin_addr.s_addr = remote_address;
         ctx->remote_sin.sin_port        = remote_port;
 
-        char remote_address_str[64];
-        client_ctx_get_remote_address(ctx, remote_address_str,
-                                      sizeof(remote_address_str));
+        if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
+            char remote_address_str[64];
+            client_ctx_get_remote_address(ctx, remote_address_str,
+                                          sizeof(remote_address_str));
 
-        if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
             printf("%-21s [%-13s]: Connecting to %s\n", address,
                    client_ctx_state(ctx), remote_address_str);
+        }
 
         int remote_sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
         if (remote_sock < 0) {
@@ -605,9 +601,9 @@ static int client_ctx_on_recv(struct ClientContext* ctx, int sock,
     return 0;
 }
 
-static int client_ctx_on_remote_recv(struct ClientContext* ctx, int remote_sock,
-                                     struct pollfd* pollfd,
-                                     struct pollfd* remote_pollfd) {
+static int client_ctx_on_remote_recv(struct ClientContext* ctx,
+                                     struct pollfd*        pollfd,
+                                     struct pollfd*        remote_pollfd) {
     size_t buffer_avail_size =
         ctx->in_queue.capacity - ring_buffer_size(&ctx->in_queue);
     if (UNLIKELY(buffer_avail_size <= 1)) {
@@ -634,14 +630,14 @@ static int client_ctx_on_remote_recv(struct ClientContext* ctx, int remote_sock,
         ring_buffer_is_trivially_allocatable(&ctx->in_queue, to_recv);
     if (is_trivially_allocatable) {
         // Recv directly to the ring buffer
-        read = recv_all(remote_sock,
+        read = recv_all(ctx->remote_sock,
                         (char*)ctx->in_queue.data + ctx->in_queue.tail, to_recv,
                         0);
         if (read > 0)
             ring_buffer_grow(&ctx->in_queue, read);
     } else {
         // Recv to the temp buffer
-        read = recv_all(remote_sock, buffer, to_recv, 0);
+        read = recv_all(ctx->remote_sock, buffer, to_recv, 0);
     }
 
     if (read < 0) {
@@ -674,8 +670,7 @@ static int client_ctx_on_remote_recv(struct ClientContext* ctx, int remote_sock,
     return 0;
 }
 
-static int client_ctx_on_send(struct ClientContext* ctx, int sock,
-                              struct pollfd* pollfd,
+static int client_ctx_on_send(struct ClientContext* ctx, struct pollfd* pollfd,
                               struct pollfd* remote_pollfd) {
     char   buffer[CLIENT_BUFFER_SIZE];
     size_t buffer_size = ring_buffer_size(&ctx->in_queue);
@@ -702,13 +697,13 @@ static int client_ctx_on_send(struct ClientContext* ctx, int sock,
     ssize_t sent;
     if (ring_buffer_is_trivially_copyable(&ctx->in_queue, buffer_size)) {
         // Send directly from the ring buffer
-        sent =
-            send_all(sock, (const char*)ctx->in_queue.data + ctx->in_queue.head,
-                     buffer_size, 0);
+        sent = send_all(ctx->sock,
+                        (const char*)ctx->in_queue.data + ctx->in_queue.head,
+                        buffer_size, 0);
     } else {
         // Copy to the temp buffer
         ring_buffer_copy(&ctx->in_queue, buffer, to_send);
-        sent = send_all(sock, buffer, to_send, 0);
+        sent = send_all(ctx->sock, buffer, to_send, 0);
     }
 
     if (sent < 0) {
@@ -741,9 +736,9 @@ static int client_ctx_on_send(struct ClientContext* ctx, int sock,
     return 0;
 }
 
-static int client_ctx_on_remote_send(struct ClientContext* ctx, int remote_sock,
-                                     struct pollfd* pollfd,
-                                     struct pollfd* remote_pollfd) {
+static int client_ctx_on_remote_send(struct ClientContext* ctx,
+                                     struct pollfd*        pollfd,
+                                     struct pollfd*        remote_pollfd) {
     if (UNLIKELY(ctx->state == CLIENT_STATE_WAIT_CONNECT)) {
         char response[4 + 4 + 2];
         response[0]                  = 0x05;                            //ver
@@ -780,12 +775,12 @@ static int client_ctx_on_remote_send(struct ClientContext* ctx, int remote_sock,
 
     ssize_t sent;
     if (ring_buffer_is_trivially_copyable(&ctx->out_queue, to_send)) {
-        sent = send_all(remote_sock,
+        sent = send_all(ctx->remote_sock,
                         (const char*)ctx->out_queue.data + ctx->out_queue.head,
                         to_send, 0);
     } else {
         ring_buffer_copy(&ctx->out_queue, buffer, to_send);
-        sent = send_all(remote_sock, buffer, to_send, 0);
+        sent = send_all(ctx->remote_sock, buffer, to_send, 0);
     }
 
     if (sent < 0) {
@@ -861,7 +856,6 @@ static int server_ctx_init(struct ServerContext* ctx, uint16_t port) {
     struct pollfd pollfd;
     pollfd.fd     = server_sock;
     pollfd.events = POLLIN;
-
     if (vector_push(&ctx->pollfds, &pollfd, sizeof(struct pollfd)) < 0) {
         perror("Failed to push server pollfd");
         return -1;
@@ -871,11 +865,21 @@ static int server_ctx_init(struct ServerContext* ctx, uint16_t port) {
 }
 
 static int server_ctx_accept(struct ServerContext* ctx) {
-    struct ClientContext client;
+    // Allocate a new client
+    struct ClientContext* client =
+        vector_alloc(&ctx->clients, sizeof(struct ClientContext));
+    if (client == NULL) {
+        perror("Failed to allocate a ClientContext");
+        return -1;
+    }
 
-    socklen_t            sin_length = sizeof(client.sin);
-    int                  client_sock =
-        accept(ctx->server_sock, (struct sockaddr*)&client.sin, &sin_length);
+    client_ctx_init(client);
+
+    // Accept socket
+    socklen_t sin_length = sizeof(client->sin);
+    int       client_sock =
+        accept(ctx->server_sock, (struct sockaddr*)&client->sin, &sin_length);
+    client->sock = client_sock;
     if (client_sock < 0) {
         perror("Accept failed");
         return -1;
@@ -901,37 +905,30 @@ static int server_ctx_accept(struct ServerContext* ctx) {
         return -1;
     }
 
-    char address[64];
-    client_ctx_get_address(&client, address, sizeof(address));
+    if (LOG_LEVEL >= LOG_LEVEL_INFO) {
+        char address[64];
+        client_ctx_get_address(client, address, sizeof(address));
 
-    // Allocate a new client
-    client_ctx_init(&client, client_sock, /* TODO: */ ctx->pollfds.length);
-
-    if (LOG_LEVEL >= LOG_LEVEL_INFO)
-        printf("%-21s [%-13s]: Connected\n", address,
-               client_ctx_state(&client));
-
-    if (vector_push(&ctx->clients, &client, sizeof(client)) < 0) {
-        perror("Failed to push a new client context");
-        return -1;
+        printf("%-21s [%-13s]: Connected\n", address, client_ctx_state(client));
     }
 
     // Allocate a new pollfd
-    struct pollfd pollfd;
-    pollfd.fd     = client_sock;
-    pollfd.events = POLLIN;
-
-    if (vector_push(&ctx->pollfds, &pollfd, sizeof(pollfd)) < 0) {
+    client->pollfd_idx    = ctx->pollfds.length;
+    struct pollfd* pollfd = vector_alloc(&ctx->pollfds, sizeof(struct pollfd));
+    if (pollfd == NULL) {
         perror("Failed to push a new pollfd");
         return -1;
     }
+
+    pollfd->fd     = client_sock;
+    pollfd->events = POLLIN;
 
     return 0;
 }
 
 static int server_free_client(struct ServerContext* ctx, size_t index) {
-    struct ClientContext* client = (struct ClientContext*)vector_get(
-        &ctx->clients, index, sizeof(struct ClientContext));
+    struct ClientContext* client =
+        vector_get(&ctx->clients, index, sizeof(struct ClientContext));
 
     if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
         char address[64];
@@ -943,7 +940,7 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
 
     // Free remote socket & pollfd
     if (client->remote_sock != INVALID_SOCKFD) {
-        struct pollfd* pollfd = (struct pollfd*)vector_get(
+        struct pollfd* pollfd = vector_get(
             &ctx->pollfds, client->remote_pollfd_idx, sizeof(struct pollfd));
         close(pollfd->fd);
 
@@ -970,8 +967,8 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
 
     // Free client socket & pollfd
     {
-        struct pollfd* pollfd = (struct pollfd*)vector_get(
-            &ctx->pollfds, client->pollfd_idx, sizeof(struct pollfd));
+        struct pollfd* pollfd = vector_get(&ctx->pollfds, client->pollfd_idx,
+                                           sizeof(struct pollfd));
         close(pollfd->fd);
 
         size_t end_pollfd_idx = ctx->pollfds.length - 1;
@@ -1000,16 +997,13 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
         0)
         return -1;
 
-    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-        printf("THERE ARE %zu CLIENTS NOW\n", ctx->clients.length);
-
     return 0;
 }
 
 static void server_ctx_free(struct ServerContext* ctx) {
     for (size_t idx = 0; idx < ctx->clients.length; idx++) {
-        struct ClientContext* client = (struct ClientContext*)vector_get(
-            &ctx->clients, idx, sizeof(struct ClientContext));
+        struct ClientContext* client =
+            vector_get(&ctx->clients, idx, sizeof(struct ClientContext));
         client_ctx_free(client);
     }
 
@@ -1106,17 +1100,17 @@ int main(int argc, char* argv[]) {
         }
 
         for (size_t idx = server.clients.length; idx-- > 0 && ready > 0;) {
-            struct ClientContext* client = (struct ClientContext*)vector_get(
-                &server.clients, idx, sizeof(struct ClientContext));
+            struct ClientContext* client =
+                vector_get(&server.clients, idx, sizeof(struct ClientContext));
 
-            struct pollfd* pollfd = (struct pollfd*)vector_get(
+            struct pollfd* pollfd = vector_get(
                 &server.pollfds, client->pollfd_idx, sizeof(struct pollfd));
 
             struct pollfd* remote_pollfd = NULL;
             if (client->remote_pollfd_idx != INVALID_POLLFD)
-                remote_pollfd = (struct pollfd*)vector_get(
-                    &server.pollfds, client->remote_pollfd_idx,
-                    sizeof(struct pollfd));
+                remote_pollfd =
+                    vector_get(&server.pollfds, client->remote_pollfd_idx,
+                               sizeof(struct pollfd));
 
             if (pollfd->revents)
                 ready--;
@@ -1131,8 +1125,8 @@ int main(int argc, char* argv[]) {
             }
 
             if (pollfd->revents & POLLIN) {
-                if (client_ctx_on_recv(client, pollfd->fd, &server.pollfds,
-                                       &auth_ctx, pollfd, remote_pollfd) < 0) {
+                if (client_ctx_on_recv(client, &server.pollfds, &auth_ctx,
+                                       pollfd, remote_pollfd) < 0) {
                     if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                         printf("Freeing client: on_recv failed\n");
                     server_free_client(&server, idx);
@@ -1141,19 +1135,17 @@ int main(int argc, char* argv[]) {
 
                 // client_ctx_on_recv may realloc server_ctx->pollfds
                 if (client->state == CLIENT_STATE_WAIT_CONNECT) {
-                    pollfd = (struct pollfd*)vector_get(&server.pollfds,
-                                                        client->pollfd_idx,
-                                                        sizeof(struct pollfd));
+                    pollfd = vector_get(&server.pollfds, client->pollfd_idx,
+                                        sizeof(struct pollfd));
 
-                    remote_pollfd = (struct pollfd*)vector_get(
-                        &server.pollfds, client->remote_pollfd_idx,
-                        sizeof(struct pollfd));
+                    remote_pollfd =
+                        vector_get(&server.pollfds, client->remote_pollfd_idx,
+                                   sizeof(struct pollfd));
                 }
             }
 
             if (pollfd->revents & POLLOUT) {
-                if (client_ctx_on_send(client, pollfd->fd, pollfd,
-                                       remote_pollfd) < 0) {
+                if (client_ctx_on_send(client, pollfd, remote_pollfd) < 0) {
                     if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                         printf("Freeing client: on_send failed\n");
                     server_free_client(&server, idx);
@@ -1174,8 +1166,8 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (remote_pollfd->revents & POLLIN) {
-                    if (client_ctx_on_remote_recv(client, remote_pollfd->fd,
-                                                  pollfd, remote_pollfd) < 0) {
+                    if (client_ctx_on_remote_recv(client, pollfd,
+                                                  remote_pollfd) < 0) {
                         if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                             printf("Freeing client: on_recv_remote failed\n");
                         server_free_client(&server, idx);
@@ -1184,8 +1176,8 @@ int main(int argc, char* argv[]) {
                 }
 
                 if (remote_pollfd->revents & POLLOUT) {
-                    if (client_ctx_on_remote_send(client, remote_pollfd->fd,
-                                                  pollfd, remote_pollfd) < 0) {
+                    if (client_ctx_on_remote_send(client, pollfd,
+                                                  remote_pollfd) < 0) {
                         if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                             printf("Freeing client: on_send_remote failed\n");
                         server_free_client(&server, idx);
