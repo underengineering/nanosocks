@@ -56,18 +56,18 @@ struct ClientContext {
     size_t             remote_pollfd_idx;
 };
 
-static void client_ctx_init(struct ClientContext* ctx) {
-    ctx->state = CLIENT_STATE_WAIT_GREET;
+static void client_ctx_init(struct ClientContext* client) {
+    client->state = CLIENT_STATE_WAIT_GREET;
 
-    ring_buffer_init(&ctx->in_queue, CLIENT_RING_BUFFER_SIZE);
-    ring_buffer_init(&ctx->out_queue, CLIENT_RING_BUFFER_SIZE);
+    ring_buffer_init(&client->in_queue, CLIENT_RING_BUFFER_SIZE);
+    ring_buffer_init(&client->out_queue, CLIENT_RING_BUFFER_SIZE);
 
-    ctx->remote_sock       = INVALID_SOCKFD;
-    ctx->remote_pollfd_idx = INVALID_POLLFD;
+    client->remote_sock       = INVALID_SOCKFD;
+    client->remote_pollfd_idx = INVALID_POLLFD;
 }
 
-static const char* client_ctx_state(struct ClientContext* ctx) {
-    switch (ctx->state) {
+static const char* client_ctx_state(struct ClientContext* client) {
+    switch (client->state) {
         case CLIENT_STATE_WAIT_GREET: return "WAIT_GREET";
         case CLIENT_STATE_WAIT_AUTH: return "WAIT_AUTH";
         case CLIENT_STATE_WAIT_REQUEST: return "WAIT_REQUEST";
@@ -79,60 +79,62 @@ static const char* client_ctx_state(struct ClientContext* ctx) {
     return NULL;
 }
 
-static void client_ctx_get_address(struct ClientContext* ctx, char* buffer,
+static void client_ctx_get_address(struct ClientContext* client, char* buffer,
                                    size_t size) {
     char address[32];
-    if (inet_ntop(AF_INET, &ctx->sin.sin_addr, address, sizeof(address)) ==
+    if (inet_ntop(AF_INET, &client->sin.sin_addr, address, sizeof(address)) ==
         NULL) {
         perror("inet_ntop failed");
         strcpy(address, "<unknown>");
     }
 
-    snprintf(buffer, size, "%s:%hu", address, ntohs(ctx->sin.sin_port));
+    snprintf(buffer, size, "%s:%hu", address, ntohs(client->sin.sin_port));
 }
 
-static void client_ctx_get_remote_address(struct ClientContext* ctx,
+static void client_ctx_get_remote_address(struct ClientContext* client,
                                           char* buffer, size_t size) {
     char address[32];
-    if (inet_ntop(AF_INET, &ctx->remote_sin.sin_addr, address,
+    if (inet_ntop(AF_INET, &client->remote_sin.sin_addr, address,
                   sizeof(address)) == NULL) {
         perror("inet_ntop failed");
         strcpy(address, "<unknown>");
     }
 
-    snprintf(buffer, size, "%s:%hu", address, ntohs(ctx->remote_sin.sin_port));
+    snprintf(buffer, size, "%s:%hu", address,
+             ntohs(client->remote_sin.sin_port));
 }
 
-static int client_ctx_on_hup(struct ClientContext* ctx) {
+static int client_ctx_on_hup(struct ClientContext* client) {
     char address[64];
-    client_ctx_get_address(ctx, address, sizeof(address));
+    client_ctx_get_address(client, address, sizeof(address));
 
     if (LOG_LEVEL >= LOG_LEVEL_INFO)
-        printf("%-21s [%-13s]: Disconnected\n", address, client_ctx_state(ctx));
+        printf("%-21s [%-13s]: Disconnected\n", address,
+               client_ctx_state(client));
 
     return -1;
 }
 
-static int client_ctx_on_remote_hup(struct ClientContext* ctx) {
+static int client_ctx_on_remote_hup(struct ClientContext* client) {
     char address[64];
-    client_ctx_get_address(ctx, address, sizeof(address));
+    client_ctx_get_address(client, address, sizeof(address));
 
     if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("%-21s [%-13s]: Remote disconnected\n", address,
-               client_ctx_state(ctx));
+               client_ctx_state(client));
 
-    if (ctx->state == CLIENT_STATE_WAIT_CONNECT) {
+    if (client->state == CLIENT_STATE_WAIT_CONNECT) {
         char response[4 + 4 + 2];
-        response[0]                  = 0x05;                            //ver
-        response[1]                  = 0x05;                            //status
-        response[2]                  = 0x00;                            //rsv
-        response[3]                  = 0x01;                            //ipv4
-        *(uint32_t*)&response[4]     = ctx->remote_sin.sin_addr.s_addr; //addr
-        *(uint16_t*)&response[4 + 4] = ctx->remote_sin.sin_port;        //port
+        response[0]              = 0x05;                               //ver
+        response[1]              = 0x05;                               //status
+        response[2]              = 0x00;                               //rsv
+        response[3]              = 0x01;                               //ipv4
+        *(uint32_t*)&response[4] = client->remote_sin.sin_addr.s_addr; //addr
+        *(uint16_t*)&response[4 + 4] = client->remote_sin.sin_port;    //port
 
-        ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+        ring_buffer_fill(&client->in_queue, response, sizeof(response));
 
-        ctx->state = CLIENT_STATE_DISCONNECTING;
+        client->state = CLIENT_STATE_DISCONNECTING;
 
         return 0;
     }
@@ -176,33 +178,34 @@ struct Socks5ConnRequestHeader {
     uint8_t address_type;
 };
 
-static void client_ctx_free(struct ClientContext* ctx) {
-    ring_buffer_free(&ctx->in_queue);
-    ring_buffer_free(&ctx->out_queue);
+static void client_ctx_free(struct ClientContext* client) {
+    ring_buffer_free(&client->in_queue);
+    ring_buffer_free(&client->out_queue);
 }
 
-static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
+static int client_ctx_on_recv(struct ClientContext*         client,
+                              struct Vector*                pollfds,
                               struct AuthenticationContext* auth_ctx,
                               struct pollfd*                pollfd,
                               struct pollfd*                remote_pollfd) {
     // Wait for remote connection first
-    if (UNLIKELY(ctx->state == CLIENT_STATE_WAIT_CONNECT)) {
+    if (UNLIKELY(client->state == CLIENT_STATE_WAIT_CONNECT)) {
         // Stop accepting data until connection is made
         pollfd->events &= ~POLLIN;
         return 0;
     }
 
     size_t buffer_avail_size =
-        ctx->out_queue.capacity - ring_buffer_size(&ctx->out_queue);
+        client->out_queue.capacity - ring_buffer_size(&client->out_queue);
     if (UNLIKELY(buffer_avail_size <= 1)) {
         // Out buffer is full
 
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
             char address[64];
-            client_ctx_get_address(ctx, address, sizeof(address));
+            client_ctx_get_address(client, address, sizeof(address));
 
             printf("%-21s [%-13s]: OUT buffer is full\n", address,
-                   client_ctx_state(ctx));
+                   client_ctx_state(client));
         }
 
         // Don't accept more data from the client
@@ -215,29 +218,30 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
     size_t  to_read = MIN(buffer_avail_size - 1, sizeof(buffer));
 
     ssize_t read;
-    if (LIKELY(ctx->state == CLIENT_STATE_STREAMING)) {
+    if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
         // Use ring buffer when streaming
         bool is_trivially_allocatable =
-            ring_buffer_is_trivially_allocatable(&ctx->out_queue, to_read);
+            ring_buffer_is_trivially_allocatable(&client->out_queue, to_read);
         if (is_trivially_allocatable) {
             // Recv directly to the ring buffer
-            read = recv_all(ctx->sock,
-                            (char*)ctx->out_queue.data + ctx->out_queue.tail,
-                            to_read, 0);
+            read =
+                recv_all(client->sock,
+                         (char*)client->out_queue.data + client->out_queue.tail,
+                         to_read, 0);
 
             if (read > 0)
-                ring_buffer_grow(&ctx->out_queue, read);
+                ring_buffer_grow(&client->out_queue, read);
         } else {
             // Recv to the temp buffer
-            read = recv_all(ctx->sock, buffer, to_read, 0);
+            read = recv_all(client->sock, buffer, to_read, 0);
 
             // Fill ring buffer with temp buffer
             if (read > 0)
-                ring_buffer_fill(&ctx->out_queue, buffer, read);
+                ring_buffer_fill(&client->out_queue, buffer, read);
         }
     } else {
         // Use stack buffer
-        read = recv_all(ctx->sock, buffer, to_read, 0);
+        read = recv_all(client->sock, buffer, to_read, 0);
     }
 
     if (read < 0) {
@@ -250,30 +254,30 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
     }
 
     if (read == 0)
-        return client_ctx_on_hup(ctx);
+        return client_ctx_on_hup(client);
 
-    if (LIKELY(ctx->state == CLIENT_STATE_STREAMING)) {
+    if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
             char address[64];
-            client_ctx_get_address(ctx, address, sizeof(address));
+            client_ctx_get_address(client, address, sizeof(address));
             printf("%-21s [%-13s]: RECV << %zd | avail=%zu sz=%zu\n", address,
-                   client_ctx_state(ctx), read, buffer_avail_size,
-                   ring_buffer_size(&ctx->out_queue));
+                   client_ctx_state(client), read, buffer_avail_size,
+                   ring_buffer_size(&client->out_queue));
         }
 
         remote_pollfd->events |= POLLOUT;
         return 0;
     }
 
-    if (ctx->state == CLIENT_STATE_WAIT_GREET) {
+    if (client->state == CLIENT_STATE_WAIT_GREET) {
         char address[64];
-        client_ctx_get_address(ctx, address, sizeof(address));
+        client_ctx_get_address(client, address, sizeof(address));
 
         ssize_t required_size = 2;
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n", address,
-                        client_ctx_state(ctx), read);
+                        client_ctx_state(client), read);
             return -1;
         }
 
@@ -281,7 +285,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (version != 0x05) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid version %02x\n",
-                        address, client_ctx_state(ctx), version);
+                        address, client_ctx_state(client), version);
             return -1;
         }
 
@@ -291,7 +295,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr,
                         "%-21s [%-13s]: Invalid size %zd for nauth %hhu\n",
-                        address, client_ctx_state(ctx), read, nauth);
+                        address, client_ctx_state(client), read, nauth);
             return -1;
         }
 
@@ -312,40 +316,40 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (!found) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Auth %02x not supported\n",
-                        address, client_ctx_state(ctx), buffer[2]);
+                        address, client_ctx_state(client), buffer[2]);
             return -1;
         }
 
         if (should_auth) {
             if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                 printf("%-21s [%-13s]: Waiting for auth\n", address,
-                       client_ctx_state(ctx));
+                       client_ctx_state(client));
 
             uint8_t response[2] = {0x05, AUTH_METHOD_USER_PASS};
-            ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+            ring_buffer_fill(&client->in_queue, response, sizeof(response));
 
             pollfd->events |= POLLOUT;
-            ctx->state = CLIENT_STATE_WAIT_AUTH;
+            client->state = CLIENT_STATE_WAIT_AUTH;
         } else {
             if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                 printf("%-21s [%-13s]: Authenticated\n", address,
-                       client_ctx_state(ctx));
+                       client_ctx_state(client));
 
             uint8_t response[2] = {0x05, AUTH_METHOD_NO_AUTH};
-            ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+            ring_buffer_fill(&client->in_queue, response, sizeof(response));
 
             pollfd->events |= POLLOUT;
-            ctx->state = CLIENT_STATE_WAIT_REQUEST;
+            client->state = CLIENT_STATE_WAIT_REQUEST;
         }
-    } else if (ctx->state == CLIENT_STATE_WAIT_AUTH) {
+    } else if (client->state == CLIENT_STATE_WAIT_AUTH) {
         char address[64];
-        client_ctx_get_address(ctx, address, sizeof(address));
+        client_ctx_get_address(client, address, sizeof(address));
 
         ssize_t required_size = 2;
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n", address,
-                        client_ctx_state(ctx), read);
+                        client_ctx_state(client), read);
             return -1;
         }
 
@@ -354,7 +358,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (version != 0x01) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid version %02x\n",
-                        address, client_ctx_state(ctx), version);
+                        address, client_ctx_state(client), version);
             return -1;
         }
 
@@ -363,7 +367,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n", address,
-                        client_ctx_state(ctx), read);
+                        client_ctx_state(client), read);
             return -1;
         }
 
@@ -377,7 +381,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n", address,
-                        client_ctx_state(ctx), read);
+                        client_ctx_state(client), read);
             return -1;
         }
 
@@ -389,36 +393,36 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (strcmp(username, auth_ctx->username)) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid password\n", address,
-                        client_ctx_state(ctx));
+                        client_ctx_state(client));
             return -1;
         }
 
         if (strcmp(password, auth_ctx->password)) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid password\n", address,
-                        client_ctx_state(ctx));
+                        client_ctx_state(client));
             return -1;
         }
 
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
             printf("%-21s [%-13s]: Authenticated\n", address,
-                   client_ctx_state(ctx));
+                   client_ctx_state(client));
 
         // Send auth success
         uint8_t response[2] = {0x01, 0x00};
-        ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+        ring_buffer_fill(&client->in_queue, response, sizeof(response));
 
         pollfd->events |= POLLOUT;
-        ctx->state = CLIENT_STATE_WAIT_REQUEST;
-    } else if (ctx->state == CLIENT_STATE_WAIT_REQUEST) {
+        client->state = CLIENT_STATE_WAIT_REQUEST;
+    } else if (client->state == CLIENT_STATE_WAIT_REQUEST) {
         char address[64];
-        client_ctx_get_address(ctx, address, sizeof(address));
+        client_ctx_get_address(client, address, sizeof(address));
 
         ssize_t required_size = sizeof(struct Socks5ConnRequestHeader);
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n", address,
-                        client_ctx_state(ctx), read);
+                        client_ctx_state(client), read);
             return -1;
         }
 
@@ -429,7 +433,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (version != 0x05) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Invalid version %02x\n",
-                        address, client_ctx_state(ctx), version);
+                        address, client_ctx_state(client), version);
             return -1;
         }
 
@@ -437,7 +441,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         if (cmd != SOCKS5_CMD_TCP_STREAM) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr, "%-21s [%-13s]: Unsupported command %02x\n",
-                        address, client_ctx_state(ctx), cmd);
+                        address, client_ctx_state(client), cmd);
             return -1;
         }
 
@@ -450,14 +454,14 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
             response[3] = 0x01;                                //ipv4
             *(uint32_t*)&response[4]     = 0;                  //addr
             *(uint16_t*)&response[4 + 4] = 0;                  //port
-            ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+            ring_buffer_fill(&client->in_queue, response, sizeof(response));
             pollfd->events |= POLLOUT;
-            ctx->state = CLIENT_STATE_DISCONNECTING;
+            client->state = CLIENT_STATE_DISCONNECTING;
 
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr,
                         "%-21s [%-13s]: Unsupported address type %02x\n",
-                        address, client_ctx_state(ctx), address_type);
+                        address, client_ctx_state(client), address_type);
 
             return 0;
         }
@@ -470,7 +474,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
             if (read < required_size) {
                 if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                     fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n",
-                            address, client_ctx_state(ctx), read);
+                            address, client_ctx_state(client), read);
                 return -1;
             }
 
@@ -483,7 +487,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
             if (read < required_size) {
                 if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                     fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n",
-                            address, client_ctx_state(ctx), read);
+                            address, client_ctx_state(client), read);
                 return -1;
             }
 
@@ -492,7 +496,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
             if (read < required_size) {
                 if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                     fprintf(stderr, "%-21s [%-13s]: Invalid size %zd\n",
-                            address, client_ctx_state(ctx), read);
+                            address, client_ctx_state(client), read);
                 return -1;
             }
 
@@ -504,7 +508,7 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
             remote_port = *(const uint16_t*)&buffer[offset];
             if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                 printf("%-21s [%-13s]: Resolving domain %s\n", address,
-                       client_ctx_state(ctx), domain);
+                       client_ctx_state(client), domain);
 
             // Resolve ipv4
             struct addrinfo* addr_info = NULL;
@@ -517,10 +521,10 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
                 *(uint32_t*)&response[4]     = remote_address;     //addr
                 *(uint16_t*)&response[4 + 4] = htons(remote_port); //port
 
-                ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+                ring_buffer_fill(&client->in_queue, response, sizeof(response));
 
                 pollfd->events |= POLLOUT;
-                ctx->state = CLIENT_STATE_DISCONNECTING;
+                client->state = CLIENT_STATE_DISCONNECTING;
 
                 perror("getaddrinfo failed");
                 return 0;
@@ -548,30 +552,30 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
                 *(uint32_t*)&response[4]     = remote_address;     //addr
                 *(uint16_t*)&response[4 + 4] = htons(remote_port); //port
 
-                ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+                ring_buffer_fill(&client->in_queue, response, sizeof(response));
 
                 pollfd->events |= POLLOUT;
-                ctx->state = CLIENT_STATE_DISCONNECTING;
+                client->state = CLIENT_STATE_DISCONNECTING;
 
                 if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                     printf("%-21s [%-13s]: Failed to resolve %s\n", address,
-                           client_ctx_state(ctx), domain);
+                           client_ctx_state(client), domain);
 
                 return 0;
             }
         }
 
-        ctx->remote_sin.sin_family      = AF_INET;
-        ctx->remote_sin.sin_addr.s_addr = remote_address;
-        ctx->remote_sin.sin_port        = remote_port;
+        client->remote_sin.sin_family      = AF_INET;
+        client->remote_sin.sin_addr.s_addr = remote_address;
+        client->remote_sin.sin_port        = remote_port;
 
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
             char remote_address_str[64];
-            client_ctx_get_remote_address(ctx, remote_address_str,
+            client_ctx_get_remote_address(client, remote_address_str,
                                           sizeof(remote_address_str));
 
             printf("%-21s [%-13s]: Connecting to %s\n", address,
-                   client_ctx_state(ctx), remote_address_str);
+                   client_ctx_state(client), remote_address_str);
         }
 
         int remote_sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -581,8 +585,8 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         }
 
         int status =
-            connect(remote_sock, (const struct sockaddr*)&ctx->remote_sin,
-                    sizeof(ctx->remote_sin));
+            connect(remote_sock, (const struct sockaddr*)&client->remote_sin,
+                    sizeof(client->remote_sin));
         if (status < 0 && errno != EINPROGRESS && errno != EWOULDBLOCK) {
             perror("connect failed");
             return -1;
@@ -595,32 +599,32 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         pollfd.events  = POLLIN | POLLOUT;
         pollfd.revents = 0;
 
-        ctx->remote_sock       = remote_sock;
-        ctx->remote_pollfd_idx = pollfds->length;
+        client->remote_sock       = remote_sock;
+        client->remote_pollfd_idx = pollfds->length;
         if (vector_push(pollfds, &pollfd, sizeof(pollfd)) < 0) {
             perror("Remote socket pollfd allocation failed");
             return -1;
         }
 
-        ctx->state = CLIENT_STATE_WAIT_CONNECT;
+        client->state = CLIENT_STATE_WAIT_CONNECT;
     }
 
     return 0;
 }
 
-static int client_ctx_on_remote_recv(struct ClientContext* ctx,
+static int client_ctx_on_remote_recv(struct ClientContext* client,
                                      struct pollfd*        pollfd,
                                      struct pollfd*        remote_pollfd) {
     size_t buffer_avail_size =
-        ctx->in_queue.capacity - ring_buffer_size(&ctx->in_queue);
+        client->in_queue.capacity - ring_buffer_size(&client->in_queue);
     if (UNLIKELY(buffer_avail_size <= 1)) {
         // In buffer is full
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
             char address[64];
-            client_ctx_get_address(ctx, address, sizeof(address));
+            client_ctx_get_address(client, address, sizeof(address));
 
             printf("%-21s [%-13s]: IN buffer is full\n", address,
-                   client_ctx_state(ctx));
+                   client_ctx_state(client));
         }
 
         // Don't accept more data from the remote
@@ -634,19 +638,19 @@ static int client_ctx_on_remote_recv(struct ClientContext* ctx,
 
     ssize_t read;
     bool    is_trivially_allocatable =
-        ring_buffer_is_trivially_allocatable(&ctx->in_queue, to_recv);
+        ring_buffer_is_trivially_allocatable(&client->in_queue, to_recv);
     if (is_trivially_allocatable) {
         // Recv directly to the ring buffer
-        read = recv_all(ctx->remote_sock,
-                        (char*)ctx->in_queue.data + ctx->in_queue.tail, to_recv,
-                        0);
+        read = recv_all(client->remote_sock,
+                        (char*)client->in_queue.data + client->in_queue.tail,
+                        to_recv, 0);
         if (read > 0)
-            ring_buffer_grow(&ctx->in_queue, read);
+            ring_buffer_grow(&client->in_queue, read);
     } else {
         // Recv to the temp buffer
-        read = recv_all(ctx->remote_sock, buffer, to_recv, 0);
+        read = recv_all(client->remote_sock, buffer, to_recv, 0);
         if (read > 0)
-            ring_buffer_fill(&ctx->in_queue, buffer, read);
+            ring_buffer_fill(&client->in_queue, buffer, read);
     }
 
     if (read < 0) {
@@ -659,15 +663,15 @@ static int client_ctx_on_remote_recv(struct ClientContext* ctx,
     }
 
     if (read == 0)
-        return client_ctx_on_remote_hup(ctx);
+        return client_ctx_on_remote_hup(client);
 
     if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
         char address[64];
-        client_ctx_get_address(ctx, address, sizeof(address));
+        client_ctx_get_address(client, address, sizeof(address));
 
         printf("%-21s [%-13s]: RECV (REMOTE) << %zd |  avail=%zu sz=%zu\n",
-               address, client_ctx_state(ctx), read, buffer_avail_size,
-               ring_buffer_size(&ctx->in_queue));
+               address, client_ctx_state(client), read, buffer_avail_size,
+               ring_buffer_size(&client->in_queue));
     }
 
     pollfd->events |= POLLOUT;
@@ -675,15 +679,16 @@ static int client_ctx_on_remote_recv(struct ClientContext* ctx,
     return 0;
 }
 
-static int client_ctx_on_send(struct ClientContext* ctx, struct pollfd* pollfd,
-                              struct pollfd* remote_pollfd) {
+static int client_ctx_on_send(struct ClientContext* client,
+                              struct pollfd*        pollfd,
+                              struct pollfd*        remote_pollfd) {
     char   buffer[CLIENT_BUFFER_SIZE];
-    size_t buffer_size = ring_buffer_size(&ctx->in_queue);
+    size_t buffer_size = ring_buffer_size(&client->in_queue);
     if (UNLIKELY(buffer_size == 0)) {
         // Wait for everything to be sent, then disconnect
-        if (ctx->state == CLIENT_STATE_DISCONNECTING) {
+        if (client->state == CLIENT_STATE_DISCONNECTING) {
             char address[64];
-            client_ctx_get_address(ctx, address, sizeof(address));
+            client_ctx_get_address(client, address, sizeof(address));
 
             if (LOG_LEVEL >= LOG_LEVEL_INFO)
                 printf("%s [DISCONNECTING]: Disconnecting\n", address);
@@ -700,15 +705,16 @@ static int client_ctx_on_send(struct ClientContext* ctx, struct pollfd* pollfd,
     size_t  to_send = MIN(buffer_size, sizeof(buffer));
 
     ssize_t sent;
-    if (ring_buffer_is_trivially_copyable(&ctx->in_queue, buffer_size)) {
+    if (ring_buffer_is_trivially_copyable(&client->in_queue, buffer_size)) {
         // Send directly from the ring buffer
-        sent = send_all(ctx->sock,
-                        (const char*)ctx->in_queue.data + ctx->in_queue.head,
-                        buffer_size, 0);
+        sent =
+            send_all(client->sock,
+                     (const char*)client->in_queue.data + client->in_queue.head,
+                     buffer_size, 0);
     } else {
         // Copy to the temp buffer
-        ring_buffer_copy(&ctx->in_queue, buffer, to_send);
-        sent = send_all(ctx->sock, buffer, to_send, 0);
+        ring_buffer_copy(&client->in_queue, buffer, to_send);
+        sent = send_all(client->sock, buffer, to_send, 0);
     }
 
     if (sent < 0) {
@@ -722,13 +728,13 @@ static int client_ctx_on_send(struct ClientContext* ctx, struct pollfd* pollfd,
 
     if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
         char address[64];
-        client_ctx_get_address(ctx, address, sizeof(address));
+        client_ctx_get_address(client, address, sizeof(address));
 
         printf("%-21s [%-13s]: SEND >> %zu | sent=%zd\n", address,
-               client_ctx_state(ctx), to_send, sent);
+               client_ctx_state(client), to_send, sent);
     }
 
-    ring_buffer_shrink(&ctx->in_queue, sent);
+    ring_buffer_shrink(&client->in_queue, sent);
 
     // We sent all data in the buffer
     if ((size_t)sent == buffer_size)
@@ -741,35 +747,35 @@ static int client_ctx_on_send(struct ClientContext* ctx, struct pollfd* pollfd,
     return 0;
 }
 
-static int client_ctx_on_remote_send(struct ClientContext* ctx,
+static int client_ctx_on_remote_send(struct ClientContext* client,
                                      struct pollfd*        pollfd,
                                      struct pollfd*        remote_pollfd) {
-    if (UNLIKELY(ctx->state == CLIENT_STATE_WAIT_CONNECT)) {
+    if (UNLIKELY(client->state == CLIENT_STATE_WAIT_CONNECT)) {
         char response[4 + 4 + 2];
-        response[0]                  = 0x05;                            //ver
-        response[1]                  = SOCKS5_STATUS_REQUEST_GRANTED;   //status
-        response[2]                  = 0x00;                            //rsv
-        response[3]                  = 0x01;                            //ipv4
-        *(uint32_t*)&response[4]     = ctx->remote_sin.sin_addr.s_addr; //addr
-        *(uint16_t*)&response[4 + 4] = ctx->remote_sin.sin_port;        //port
-        ring_buffer_fill(&ctx->in_queue, response, sizeof(response));
+        response[0]              = 0x05;                               //ver
+        response[1]              = SOCKS5_STATUS_REQUEST_GRANTED;      //status
+        response[2]              = 0x00;                               //rsv
+        response[3]              = 0x01;                               //ipv4
+        *(uint32_t*)&response[4] = client->remote_sin.sin_addr.s_addr; //addr
+        *(uint16_t*)&response[4 + 4] = client->remote_sin.sin_port;    //port
+        ring_buffer_fill(&client->in_queue, response, sizeof(response));
 
         pollfd->events |= POLLIN | POLLOUT;
 
         char address[64];
-        client_ctx_get_address(ctx, address, sizeof(address));
+        client_ctx_get_address(client, address, sizeof(address));
 
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
             printf("%-21s [%-13s]: Connected to remote\n", address,
-                   client_ctx_state(ctx));
+                   client_ctx_state(client));
 
-        ctx->state = CLIENT_STATE_STREAMING;
+        client->state = CLIENT_STATE_STREAMING;
     }
 
-    size_t buffer_size = ring_buffer_size(&ctx->out_queue);
+    size_t buffer_size = ring_buffer_size(&client->out_queue);
     if (UNLIKELY(buffer_size == 0)) {
         // There is nothing to send to the remote
-        if (ctx->state == CLIENT_STATE_STREAMING)
+        if (client->state == CLIENT_STATE_STREAMING)
             remote_pollfd->events &= ~POLLOUT;
 
         return 0;
@@ -779,13 +785,14 @@ static int client_ctx_on_remote_send(struct ClientContext* ctx,
     size_t  to_send = MIN(buffer_size, sizeof(buffer));
 
     ssize_t sent;
-    if (ring_buffer_is_trivially_copyable(&ctx->out_queue, to_send)) {
-        sent = send_all(ctx->remote_sock,
-                        (const char*)ctx->out_queue.data + ctx->out_queue.head,
+    if (ring_buffer_is_trivially_copyable(&client->out_queue, to_send)) {
+        sent = send_all(client->remote_sock,
+                        (const char*)client->out_queue.data +
+                            client->out_queue.head,
                         to_send, 0);
     } else {
-        ring_buffer_copy(&ctx->out_queue, buffer, to_send);
-        sent = send_all(ctx->remote_sock, buffer, to_send, 0);
+        ring_buffer_copy(&client->out_queue, buffer, to_send);
+        sent = send_all(client->remote_sock, buffer, to_send, 0);
     }
 
     if (sent < 0) {
@@ -799,13 +806,13 @@ static int client_ctx_on_remote_send(struct ClientContext* ctx,
 
     if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
         char address[64];
-        client_ctx_get_address(ctx, address, sizeof(address));
+        client_ctx_get_address(client, address, sizeof(address));
 
         printf("%-21s [%-13s]: SEND (REMOTE) >> %zu | sent=%zd\n", address,
-               client_ctx_state(ctx), to_send, sent);
+               client_ctx_state(client), to_send, sent);
     }
 
-    ring_buffer_shrink(&ctx->out_queue, to_send);
+    ring_buffer_shrink(&client->out_queue, to_send);
 
     // We sent all data in the buffer
     if ((size_t)sent == buffer_size)
@@ -823,8 +830,8 @@ struct ServerContext {
     struct Vector clients;
 };
 
-static int server_ctx_init(struct ServerContext* ctx, uint16_t port) {
-    int server_sock = ctx->server_sock =
+static int server_ctx_init(struct ServerContext* server, uint16_t port) {
+    int server_sock = server->server_sock =
         socket(AF_INET, SOCK_STREAM | O_NONBLOCK, 0);
     if (server_sock < 0) {
         perror("Failed to create server socket");
@@ -847,14 +854,14 @@ static int server_ctx_init(struct ServerContext* ctx, uint16_t port) {
         }
     }
 
-    vector_init(&ctx->pollfds, 0, 0);
-    vector_init(&ctx->clients, 0, 0);
+    vector_init(&server->pollfds, 0, 0);
+    vector_init(&server->clients, 0, 0);
 
     // Create server pollfd
     struct pollfd pollfd;
     pollfd.fd     = server_sock;
     pollfd.events = POLLIN;
-    if (vector_push(&ctx->pollfds, &pollfd, sizeof(struct pollfd)) < 0) {
+    if (vector_push(&server->pollfds, &pollfd, sizeof(struct pollfd)) < 0) {
         perror("Failed to push server pollfd");
         return -1;
     }
@@ -862,10 +869,10 @@ static int server_ctx_init(struct ServerContext* ctx, uint16_t port) {
     return 0;
 }
 
-static int server_ctx_accept(struct ServerContext* ctx) {
+static int server_ctx_accept(struct ServerContext* server) {
     // Allocate a new client
     struct ClientContext* client =
-        vector_alloc(&ctx->clients, sizeof(struct ClientContext));
+        vector_alloc(&server->clients, sizeof(struct ClientContext));
     if (client == NULL) {
         perror("Failed to allocate a ClientContext");
         return -1;
@@ -874,10 +881,10 @@ static int server_ctx_accept(struct ServerContext* ctx) {
     client_ctx_init(client);
 
     // Accept socket
-    socklen_t sin_length = sizeof(client->sin);
-    int       client_sock =
-        accept(ctx->server_sock, (struct sockaddr*)&client->sin, &sin_length);
-    client->sock = client_sock;
+    socklen_t sin_length  = sizeof(client->sin);
+    int       client_sock = accept(server->server_sock,
+                                   (struct sockaddr*)&client->sin, &sin_length);
+    client->sock          = client_sock;
     if (client_sock < 0) {
         perror("Accept failed");
         return -1;
@@ -911,8 +918,9 @@ static int server_ctx_accept(struct ServerContext* ctx) {
     }
 
     // Allocate a new pollfd
-    client->pollfd_idx    = ctx->pollfds.length;
-    struct pollfd* pollfd = vector_alloc(&ctx->pollfds, sizeof(struct pollfd));
+    client->pollfd_idx = server->pollfds.length;
+    struct pollfd* pollfd =
+        vector_alloc(&server->pollfds, sizeof(struct pollfd));
     if (pollfd == NULL) {
         perror("Failed to push a new pollfd");
         return -1;
@@ -924,9 +932,9 @@ static int server_ctx_accept(struct ServerContext* ctx) {
     return 0;
 }
 
-static int server_free_client(struct ServerContext* ctx, size_t index) {
+static int server_free_client(struct ServerContext* server, size_t index) {
     struct ClientContext* client =
-        vector_get(&ctx->clients, index, sizeof(struct ClientContext));
+        vector_get(&server->clients, index, sizeof(struct ClientContext));
 
     if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
         char address[64];
@@ -939,14 +947,14 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
     // Free remote socket & pollfd
     if (client->remote_sock != INVALID_SOCKFD) {
         struct pollfd* pollfd = vector_get(
-            &ctx->pollfds, client->remote_pollfd_idx, sizeof(struct pollfd));
+            &server->pollfds, client->remote_pollfd_idx, sizeof(struct pollfd));
         close(pollfd->fd);
 
-        size_t end_pollfd_idx = ctx->pollfds.length - 1;
+        size_t end_pollfd_idx = server->pollfds.length - 1;
         if (client->remote_pollfd_idx != end_pollfd_idx) {
-            for (size_t idx = 0; idx < ctx->clients.length; idx++) {
+            for (size_t idx = 0; idx < server->clients.length; idx++) {
                 struct ClientContext* other_client = vector_get(
-                    &ctx->clients, idx, sizeof(struct ClientContext));
+                    &server->clients, idx, sizeof(struct ClientContext));
                 if (other_client->pollfd_idx == end_pollfd_idx) {
                     other_client->pollfd_idx = client->remote_pollfd_idx;
                     break;
@@ -957,7 +965,7 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
             }
         }
 
-        if (vector_swap_remove(&ctx->pollfds, client->remote_pollfd_idx,
+        if (vector_swap_remove(&server->pollfds, client->remote_pollfd_idx,
                                sizeof(struct pollfd)) < 0) {
             return -1;
         }
@@ -965,16 +973,16 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
 
     // Free client socket & pollfd
     {
-        struct pollfd* pollfd = vector_get(&ctx->pollfds, client->pollfd_idx,
+        struct pollfd* pollfd = vector_get(&server->pollfds, client->pollfd_idx,
                                            sizeof(struct pollfd));
         close(pollfd->fd);
 
-        size_t end_pollfd_idx = ctx->pollfds.length - 1;
+        size_t end_pollfd_idx = server->pollfds.length - 1;
         if (client->pollfd_idx != end_pollfd_idx) {
             // Update potentially swapped pollfd indexes
-            for (size_t idx = 0; idx < ctx->clients.length; idx++) {
+            for (size_t idx = 0; idx < server->clients.length; idx++) {
                 struct ClientContext* other_client = vector_get(
-                    &ctx->clients, idx, sizeof(struct ClientContext));
+                    &server->clients, idx, sizeof(struct ClientContext));
                 if (other_client->pollfd_idx == end_pollfd_idx) {
                     other_client->pollfd_idx = client->pollfd_idx;
                     break;
@@ -985,29 +993,29 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
             }
         }
 
-        if (vector_swap_remove(&ctx->pollfds, client->pollfd_idx,
+        if (vector_swap_remove(&server->pollfds, client->pollfd_idx,
                                sizeof(struct pollfd)) < 0)
             return -1;
     }
 
     client_ctx_free(client);
-    if (vector_swap_remove(&ctx->clients, index, sizeof(struct ClientContext)) <
-        0)
+    if (vector_swap_remove(&server->clients, index,
+                           sizeof(struct ClientContext)) < 0)
         return -1;
 
     return 0;
 }
 
-static void server_ctx_free(struct ServerContext* ctx) {
-    for (size_t idx = 0; idx < ctx->clients.length; idx++) {
+static void server_ctx_free(struct ServerContext* server) {
+    for (size_t idx = 0; idx < server->clients.length; idx++) {
         struct ClientContext* client =
-            vector_get(&ctx->clients, idx, sizeof(struct ClientContext));
+            vector_get(&server->clients, idx, sizeof(struct ClientContext));
         client_ctx_free(client);
     }
 
-    vector_free(&ctx->clients);
-    vector_free(&ctx->pollfds);
-    close(ctx->server_sock);
+    vector_free(&server->clients);
+    vector_free(&server->pollfds);
+    close(server->server_sock);
 }
 
 static volatile bool g_should_stop = false;
