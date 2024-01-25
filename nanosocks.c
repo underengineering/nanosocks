@@ -1097,7 +1097,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        for (size_t idx = server.clients.length; idx-- > 0 && ready > 0;) {
+        for (size_t idx = 0; idx < server.clients.length && ready > 0;) {
             struct ClientContext* client =
                 vector_get(&server.clients, idx, sizeof(struct ClientContext));
 
@@ -1176,6 +1176,8 @@ int main(int argc, char* argv[]) {
                 server_free_client(&server, idx);
                 continue;
             }
+
+            idx++;
         }
     }
 
