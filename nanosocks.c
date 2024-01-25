@@ -51,14 +51,23 @@ struct ClientContext {
 
     int                sock;
     int                remote_sock;
+
+    size_t             pollfd_idx;
+    size_t             remote_pollfd_idx;
 };
 
-static void client_ctx_init(struct ClientContext* ctx, int sock) {
+static void client_ctx_init(struct ClientContext* ctx, int sock,
+                            size_t pollfd_idx) {
     ctx->state = CLIENT_STATE_WAIT_GREET;
+
     ring_buffer_init(&ctx->in_queue, CLIENT_RING_BUFFER_SIZE);
     ring_buffer_init(&ctx->out_queue, CLIENT_RING_BUFFER_SIZE);
+
     ctx->sock        = sock;
     ctx->remote_sock = INVALID_SOCKFD;
+
+    ctx->pollfd_idx        = pollfd_idx;
+    ctx->remote_pollfd_idx = INVALID_POLLFD;
 }
 
 static const char* client_ctx_state(struct ClientContext* ctx) {
@@ -583,7 +592,8 @@ static int client_ctx_on_recv(struct ClientContext* ctx, int sock,
         pollfd.events  = POLLIN | POLLOUT;
         pollfd.revents = 0;
 
-        ctx->remote_sock = remote_sock;
+        ctx->remote_sock       = remote_sock;
+        ctx->remote_pollfd_idx = pollfds->length;
         if (vector_push(pollfds, &pollfd, sizeof(pollfd)) < 0) {
             perror("Remote socket pollfd allocation failed");
             return -1;
@@ -895,7 +905,7 @@ static int server_ctx_accept(struct ServerContext* ctx) {
     client_ctx_get_address(&client, address, sizeof(address));
 
     // Allocate a new client
-    client_ctx_init(&client, client_sock);
+    client_ctx_init(&client, client_sock, /* TODO: */ ctx->pollfds.length);
 
     if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("%-21s [%-13s]: Connected\n", address,
@@ -933,25 +943,55 @@ static int server_free_client(struct ServerContext* ctx, size_t index) {
 
     // Free remote socket & pollfd
     if (client->remote_sock != INVALID_SOCKFD) {
-        size_t idx =
-            find_pollfd_by_fd((struct pollfd*)ctx->pollfds.data,
-                              ctx->pollfds.length, client->remote_sock);
         struct pollfd* pollfd = (struct pollfd*)vector_get(
-            &ctx->pollfds, idx, sizeof(struct pollfd));
+            &ctx->pollfds, client->remote_pollfd_idx, sizeof(struct pollfd));
         close(pollfd->fd);
-        if (vector_swap_remove(&ctx->pollfds, idx, sizeof(struct pollfd)) < 0) {
+
+        size_t end_pollfd_idx = ctx->pollfds.length - 1;
+        if (client->remote_pollfd_idx != end_pollfd_idx) {
+            for (size_t idx = 0; idx < ctx->clients.length; idx++) {
+                struct ClientContext* other_client = vector_get(
+                    &ctx->clients, idx, sizeof(struct ClientContext));
+                if (other_client->pollfd_idx == end_pollfd_idx) {
+                    other_client->pollfd_idx = client->remote_pollfd_idx;
+                    break;
+                } else if (other_client->remote_pollfd_idx == end_pollfd_idx) {
+                    other_client->remote_pollfd_idx = client->remote_pollfd_idx;
+                    break;
+                }
+            }
+        }
+
+        if (vector_swap_remove(&ctx->pollfds, client->remote_pollfd_idx,
+                               sizeof(struct pollfd)) < 0) {
             return -1;
         }
     }
 
     // Free client socket & pollfd
     {
-        size_t idx = find_pollfd_by_fd((struct pollfd*)ctx->pollfds.data,
-                                       ctx->pollfds.length, client->sock);
         struct pollfd* pollfd = (struct pollfd*)vector_get(
-            &ctx->pollfds, idx, sizeof(struct pollfd));
+            &ctx->pollfds, client->pollfd_idx, sizeof(struct pollfd));
         close(pollfd->fd);
-        if (vector_swap_remove(&ctx->pollfds, idx, sizeof(struct pollfd)) < 0)
+
+        size_t end_pollfd_idx = ctx->pollfds.length - 1;
+        if (client->pollfd_idx != end_pollfd_idx) {
+            // Update potentially swapped pollfd indexes
+            for (size_t idx = 0; idx < ctx->clients.length; idx++) {
+                struct ClientContext* other_client = vector_get(
+                    &ctx->clients, idx, sizeof(struct ClientContext));
+                if (other_client->pollfd_idx == end_pollfd_idx) {
+                    other_client->pollfd_idx = client->pollfd_idx;
+                    break;
+                } else if (other_client->remote_pollfd_idx == end_pollfd_idx) {
+                    other_client->remote_pollfd_idx = client->pollfd_idx;
+                    break;
+                }
+            }
+        }
+
+        if (vector_swap_remove(&ctx->pollfds, client->pollfd_idx,
+                               sizeof(struct pollfd)) < 0)
             return -1;
     }
 
@@ -986,30 +1026,6 @@ static void          on_sigint(int sig) {
 }
 
 int main(int argc, char* argv[]) {
-    /* struct DenseMap map;
-    dense_map_init(&map, 16);
-    dense_map_add(&map, 0, (void*)0x0);
-    dense_map_add(&map, 1, (void*)0x1);
-    dense_map_add(&map, 2, (void*)0x2);
-    dense_map_add(&map, 16, (void*)0x16);
-    dense_map_add(&map, 17, (void*)0x17);
-    dense_map_add(&map, 16 * 2, (void*)0x666);
-
-    printf("at 0: %p\n", dense_map_get(&map, 0));
-    printf("at 1: %p\n", dense_map_get(&map, 1));
-    printf("at 16: %p\n", dense_map_get(&map, 16));
-
-    printf("REMOVING 16\n");
-    dense_map_remove(&map, 16 * 2);
-    printf("at 16: %p\n", dense_map_find(&map, 16));
-    printf("at 17 (симнадцоть): %p\n", dense_map_find(&map, 17));
-    printf("at 16*2 (не симнадцоть): %p\n", dense_map_find(&map, 16 * 2));
-    printf("at 0: %p\n", dense_map_find(&map, 0));
-    printf("at 1: %p\n", dense_map_find(&map, 1));
-
-    dense_map_free(&map);
-    return 0; */
-
     if (argc <= 1) {
         fprintf(stderr, "Usage: %s [OPTIONS]\n", argv[0]);
         fprintf(stderr, "Options:\n");
@@ -1093,20 +1109,14 @@ int main(int argc, char* argv[]) {
             struct ClientContext* client = (struct ClientContext*)vector_get(
                 &server.clients, idx, sizeof(struct ClientContext));
 
-            size_t pollfd_idx =
-                find_pollfd_by_fd((struct pollfd*)server.pollfds.data,
-                                  server.pollfds.length, client->sock);
             struct pollfd* pollfd = (struct pollfd*)vector_get(
-                &server.pollfds, pollfd_idx, sizeof(struct pollfd));
+                &server.pollfds, client->pollfd_idx, sizeof(struct pollfd));
 
             struct pollfd* remote_pollfd = NULL;
-            if (client->remote_sock != INVALID_SOCKFD) {
-                size_t remote_pollfd_idx = find_pollfd_by_fd(
-                    (struct pollfd*)server.pollfds.data, server.pollfds.length,
-                    client->remote_sock);
+            if (client->remote_pollfd_idx != INVALID_POLLFD)
                 remote_pollfd = (struct pollfd*)vector_get(
-                    &server.pollfds, remote_pollfd_idx, sizeof(struct pollfd));
-            }
+                    &server.pollfds, client->remote_pollfd_idx,
+                    sizeof(struct pollfd));
 
             if (pollfd->revents)
                 ready--;
@@ -1131,17 +1141,12 @@ int main(int argc, char* argv[]) {
 
                 // client_ctx_on_recv may realloc server_ctx->pollfds
                 if (client->state == CLIENT_STATE_WAIT_CONNECT) {
-                    pollfd_idx =
-                        find_pollfd_by_fd((struct pollfd*)server.pollfds.data,
-                                          server.pollfds.length, client->sock);
-                    pollfd = (struct pollfd*)vector_get(
-                        &server.pollfds, pollfd_idx, sizeof(struct pollfd));
+                    pollfd = (struct pollfd*)vector_get(&server.pollfds,
+                                                        client->pollfd_idx,
+                                                        sizeof(struct pollfd));
 
-                    size_t remote_pollfd_idx = find_pollfd_by_fd(
-                        (struct pollfd*)server.pollfds.data,
-                        server.pollfds.length, client->remote_sock);
                     remote_pollfd = (struct pollfd*)vector_get(
-                        &server.pollfds, remote_pollfd_idx,
+                        &server.pollfds, client->remote_pollfd_idx,
                         sizeof(struct pollfd));
                 }
             }
@@ -1157,6 +1162,8 @@ int main(int argc, char* argv[]) {
             }
 
             if (remote_pollfd != NULL && remote_pollfd->revents) {
+                ready--;
+
                 if (remote_pollfd->revents & (POLLHUP | POLLERR)) {
                     if (client_ctx_on_remote_hup(client) < 0) {
                         if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
@@ -1185,8 +1192,6 @@ int main(int argc, char* argv[]) {
                         continue;
                     }
                 }
-
-                ready--;
             }
         }
     }
