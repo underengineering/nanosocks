@@ -51,16 +51,6 @@ static ssize_t send_all(int sock, const void* buffer, size_t size, int flags) {
     return sent_total;
 }
 
-static size_t find_pollfd_by_fd(struct pollfd* pollfds, size_t size, int fd) {
-    for (size_t idx = 0; idx < size; idx++) {
-        struct pollfd* pollfd = &pollfds[idx];
-        if (pollfd->fd == fd)
-            return idx;
-    }
-
-    return INVALID_SOCKFD;
-}
-
 static void memswap(void* data1, void* data2, size_t size) {
     char* d1 = data1;
     char* d2 = data2;
@@ -460,7 +450,7 @@ static void* dense_map_remove(struct DenseMap* map, size_t key) {
     return data;
 }
 
-static void* dense_map_free(struct DenseMap* map) {
+static void dense_map_free(struct DenseMap* map) {
     vector_free(&map->buckets);
     vector_free(&map->entries);
 }
