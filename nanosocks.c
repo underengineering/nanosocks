@@ -946,9 +946,7 @@ static int server_free_client(struct ServerContext* server, size_t index) {
 
     // Free remote socket & pollfd
     if (client->remote_sock != INVALID_SOCKFD) {
-        struct pollfd* pollfd = vector_get(
-            &server->pollfds, client->remote_pollfd_idx, sizeof(struct pollfd));
-        close(pollfd->fd);
+        close(client->remote_sock);
 
         size_t end_pollfd_idx = server->pollfds.length - 1;
         if (client->remote_pollfd_idx != end_pollfd_idx) {
@@ -973,9 +971,7 @@ static int server_free_client(struct ServerContext* server, size_t index) {
 
     // Free client socket & pollfd
     {
-        struct pollfd* pollfd = vector_get(&server->pollfds, client->pollfd_idx,
-                                           sizeof(struct pollfd));
-        close(pollfd->fd);
+        close(client->sock);
 
         size_t end_pollfd_idx = server->pollfds.length - 1;
         if (client->pollfd_idx != end_pollfd_idx) {
