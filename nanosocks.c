@@ -840,13 +840,6 @@ static int server_ctx_init(struct ServerContext* ctx, uint16_t port) {
             perror("Listen failed");
             return -1;
         }
-
-        int value = 1;
-        if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEPORT, &value,
-                       sizeof(value)) < 0) {
-            perror("setsockopt failed");
-            return -1;
-        }
     }
 
     vector_init(&ctx->pollfds, 0, 0);
