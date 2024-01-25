@@ -252,9 +252,9 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
     if (read == 0)
         return client_ctx_on_hup(ctx);
 
-    char address[64];
     if (LIKELY(ctx->state == CLIENT_STATE_STREAMING)) {
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
+            char address[64];
             client_ctx_get_address(ctx, address, sizeof(address));
             printf("%-21s [%-13s]: RECV << %zd | avail=%zu sz=%zu\n", address,
                    client_ctx_state(ctx), read, buffer_avail_size,
@@ -265,9 +265,10 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         return 0;
     }
 
-    client_ctx_get_address(ctx, address, sizeof(address));
-
     if (ctx->state == CLIENT_STATE_WAIT_GREET) {
+        char address[64];
+        client_ctx_get_address(ctx, address, sizeof(address));
+
         ssize_t required_size = 2;
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
@@ -337,6 +338,9 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
             ctx->state = CLIENT_STATE_WAIT_REQUEST;
         }
     } else if (ctx->state == CLIENT_STATE_WAIT_AUTH) {
+        char address[64];
+        client_ctx_get_address(ctx, address, sizeof(address));
+
         ssize_t required_size = 2;
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
@@ -407,6 +411,9 @@ static int client_ctx_on_recv(struct ClientContext* ctx, struct Vector* pollfds,
         pollfd->events |= POLLOUT;
         ctx->state = CLIENT_STATE_WAIT_REQUEST;
     } else if (ctx->state == CLIENT_STATE_WAIT_REQUEST) {
+        char address[64];
+        client_ctx_get_address(ctx, address, sizeof(address));
+
         ssize_t required_size = sizeof(struct Socks5ConnRequestHeader);
         if (read < required_size) {
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
