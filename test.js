@@ -1,7 +1,7 @@
 const http = require("node:http");
 const fs = require("node:fs");
 
-const ZEROS = Buffer.alloc(2048);
+const ZEROS = Buffer.alloc(8192);
 const DATA = fs.readFileSync("./data");
 const server = http.createServer(async (req, res) => {
   if (req.url === "/down_rnd") {
@@ -37,7 +37,7 @@ const server = http.createServer(async (req, res) => {
     write().finally(() => res.end());
   } else if (req.url === "/up") {
     console.log("up");
-    req.on("data", (chunk) => console.log(chunk));
+    req.on("data", (chunk) => console.log(chunk.length));
     req.on("end", () => res.end());
   }
 });
