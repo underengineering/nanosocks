@@ -1112,16 +1112,19 @@ int main(int argc, char* argv[]) {
                     vector_get(&server.pollfds, client->remote_pollfd_idx,
                                sizeof(struct pollfd));
 
+            short remote_revents =
+                remote_pollfd != NULL ? remote_pollfd->revents : 0;
             if (pollfd->revents)
                 ready--;
+            if (remote_revents)
+                ready--;
 
-            if (pollfd->revents & (POLLHUP | POLLERR)) {
-                if (client_ctx_on_hup(client) < 0) {
-                    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                        printf("Freeing client: on_hup failed\n");
-                    server_free_client(&server, idx);
-                    continue;
-                }
+            if (UNLIKELY(pollfd->revents & (POLLHUP | POLLERR) &&
+                         client_ctx_on_hup(client) < 0)) {
+                if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+                    printf("Freeing client: on_hup failed\n");
+                server_free_client(&server, idx);
+                continue;
             }
 
             if (pollfd->revents & POLLIN) {
@@ -1144,46 +1147,36 @@ int main(int argc, char* argv[]) {
                 }
             }
 
-            if (pollfd->revents & POLLOUT) {
-                if (client_ctx_on_send(client, pollfd, remote_pollfd) < 0) {
-                    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                        printf("Freeing client: on_send failed\n");
-                    server_free_client(&server, idx);
-                    continue;
-                }
+            if (remote_revents & POLLOUT &&
+                client_ctx_on_remote_send(client, pollfd, remote_pollfd) < 0) {
+                if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+                    printf("Freeing client: on_send_remote failed\n");
+                server_free_client(&server, idx);
+                continue;
             }
 
-            if (remote_pollfd != NULL && remote_pollfd->revents) {
-                ready--;
+            if (remote_revents & POLLIN &&
+                client_ctx_on_remote_recv(client, pollfd, remote_pollfd) < 0) {
+                if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+                    printf("Freeing client: on_recv_remote failed\n");
+                server_free_client(&server, idx);
+                continue;
+            }
 
-                if (remote_pollfd->revents & (POLLHUP | POLLERR)) {
-                    if (client_ctx_on_remote_hup(client) < 0) {
-                        if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                            printf("Freeing client: on_remote_hup failed\n");
-                        server_free_client(&server, idx);
-                        continue;
-                    }
-                }
+            if (pollfd->revents & POLLOUT &&
+                client_ctx_on_send(client, pollfd, remote_pollfd) < 0) {
+                if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+                    printf("Freeing client: on_send failed\n");
+                server_free_client(&server, idx);
+                continue;
+            }
 
-                if (remote_pollfd->revents & POLLIN) {
-                    if (client_ctx_on_remote_recv(client, pollfd,
-                                                  remote_pollfd) < 0) {
-                        if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                            printf("Freeing client: on_recv_remote failed\n");
-                        server_free_client(&server, idx);
-                        continue;
-                    }
-                }
-
-                if (remote_pollfd->revents & POLLOUT) {
-                    if (client_ctx_on_remote_send(client, pollfd,
-                                                  remote_pollfd) < 0) {
-                        if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                            printf("Freeing client: on_send_remote failed\n");
-                        server_free_client(&server, idx);
-                        continue;
-                    }
-                }
+            if (UNLIKELY(remote_revents & (POLLHUP | POLLERR) &&
+                         client_ctx_on_remote_hup(client) < 0)) {
+                if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+                    printf("Freeing client: on_remote_hup failed\n");
+                server_free_client(&server, idx);
+                continue;
             }
         }
     }
