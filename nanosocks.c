@@ -645,6 +645,8 @@ static int client_ctx_on_remote_recv(struct ClientContext* ctx,
     } else {
         // Recv to the temp buffer
         read = recv_all(ctx->remote_sock, buffer, to_recv, 0);
+        if (read > 0)
+            ring_buffer_fill(&ctx->in_queue, buffer, read);
     }
 
     if (read < 0) {
@@ -667,10 +669,6 @@ static int client_ctx_on_remote_recv(struct ClientContext* ctx,
                address, client_ctx_state(ctx), read, buffer_avail_size,
                ring_buffer_size(&ctx->in_queue));
     }
-
-    // Fill ring buffer with temp buffer
-    if (!is_trivially_allocatable)
-        ring_buffer_fill(&ctx->in_queue, buffer, read);
 
     pollfd->events |= POLLOUT;
 

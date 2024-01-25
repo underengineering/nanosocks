@@ -181,6 +181,9 @@ static size_t ring_buffer_size(struct RingBuffer* buf) {
 
 static bool ring_buffer_is_trivially_allocatable(struct RingBuffer* buf,
                                                  size_t             size) {
+    if (buf->head == buf->tail)
+        return true;
+
     if (buf->tail >= buf->head) {
         // >= [HEAD<---->TAIL====]
         // <  [====HEAD<---->TAIL]
