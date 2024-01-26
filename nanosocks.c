@@ -246,7 +246,10 @@ static int client_ctx_on_recv(struct ClientContext*         client,
 
     if (read < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("recv failed");
+            char address[64];
+            client_ctx_get_address(client, address, sizeof(address));
+            fprintf(stderr, "%-21s [%-13s]: Recv failed: %s\n", address,
+                    client_ctx_state(client), strerror(errno));
             return -1;
         }
 
@@ -588,7 +591,7 @@ static int client_ctx_on_recv(struct ClientContext*         client,
             connect(remote_sock, (const struct sockaddr*)&client->remote_sin,
                     sizeof(client->remote_sin));
         if (status < 0 && errno != EINPROGRESS && errno != EWOULDBLOCK) {
-            perror("connect failed");
+            perror("Connect failed");
             return -1;
         }
 
@@ -655,7 +658,10 @@ static int client_ctx_on_remote_recv(struct ClientContext* client,
 
     if (read < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("Remote recv failed");
+            char address[64];
+            client_ctx_get_address(client, address, sizeof(address));
+            fprintf(stderr, "%-21s [%-13s]: Remote recv failed: %s\n", address,
+                    client_ctx_state(client), strerror(errno));
             return -1;
         }
 
@@ -719,7 +725,10 @@ static int client_ctx_on_send(struct ClientContext* client,
 
     if (sent < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("send failed");
+            char address[64];
+            client_ctx_get_address(client, address, sizeof(address));
+            fprintf(stderr, "%-21s [%-13s]: Send failed: %s\n", address,
+                    client_ctx_state(client), strerror(errno));
             return -1;
         }
 
@@ -797,7 +806,10 @@ static int client_ctx_on_remote_send(struct ClientContext* client,
 
     if (sent < 0) {
         if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            perror("Remote send failed");
+            char address[64];
+            client_ctx_get_address(client, address, sizeof(address));
+            fprintf(stderr, "%-21s [%-13s]: Remote send failed: %s\n", address,
+                    client_ctx_state(client), strerror(errno));
             return -1;
         }
 
