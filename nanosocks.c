@@ -850,6 +850,13 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
         return -1;
     }
 
+    int value = 1;
+    if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &value,
+                   sizeof(value)) < 0) {
+        perror("setsockopt failed");
+        return -1;
+    }
+
     {
         struct sockaddr_in sin;
         sin.sin_family      = AF_INET;
