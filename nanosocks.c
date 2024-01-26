@@ -914,7 +914,8 @@ static int server_ctx_accept(struct ServerContext* server) {
         char address[64];
         client_ctx_get_address(client, address, sizeof(address));
 
-        printf("%-21s [%-13s]: Connected\n", address, client_ctx_state(client));
+        printf("%-21s [%-13s]: Connected #%zu\n", address,
+               client_ctx_state(client), server->clients.length);
     }
 
     // Allocate a new pollfd
@@ -949,14 +950,17 @@ static int server_free_client(struct ServerContext* server, size_t index) {
         close(client->remote_sock);
 
         size_t end_pollfd_idx = server->pollfds.length - 1;
-        if (client->remote_pollfd_idx != end_pollfd_idx) {
+        if (client->remote_pollfd_idx < end_pollfd_idx) {
+            // Update potentially swapped pollfd indexes
             for (size_t idx = 0; idx < server->clients.length; idx++) {
                 struct ClientContext* other_client = vector_get(
                     &server->clients, idx, sizeof(struct ClientContext));
                 if (other_client->pollfd_idx == end_pollfd_idx) {
                     other_client->pollfd_idx = client->remote_pollfd_idx;
                     break;
-                } else if (other_client->remote_pollfd_idx == end_pollfd_idx) {
+                }
+
+                if (other_client->remote_pollfd_idx == end_pollfd_idx) {
                     other_client->remote_pollfd_idx = client->remote_pollfd_idx;
                     break;
                 }
@@ -974,7 +978,7 @@ static int server_free_client(struct ServerContext* server, size_t index) {
         close(client->sock);
 
         size_t end_pollfd_idx = server->pollfds.length - 1;
-        if (client->pollfd_idx != end_pollfd_idx) {
+        if (client->pollfd_idx < end_pollfd_idx) {
             // Update potentially swapped pollfd indexes
             for (size_t idx = 0; idx < server->clients.length; idx++) {
                 struct ClientContext* other_client = vector_get(
@@ -982,7 +986,9 @@ static int server_free_client(struct ServerContext* server, size_t index) {
                 if (other_client->pollfd_idx == end_pollfd_idx) {
                     other_client->pollfd_idx = client->pollfd_idx;
                     break;
-                } else if (other_client->remote_pollfd_idx == end_pollfd_idx) {
+                }
+
+                if (other_client->remote_pollfd_idx == end_pollfd_idx) {
                     other_client->remote_pollfd_idx = client->pollfd_idx;
                     break;
                 }
