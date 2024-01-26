@@ -51,16 +51,6 @@ static ssize_t send_all(int sock, const void* buffer, size_t size, int flags) {
     return sent_total;
 }
 
-static void memswap(void* data1, void* data2, size_t size) {
-    char* d1 = data1;
-    char* d2 = data2;
-    while (size--) {
-        char tmp = *d1;
-        *d1++    = *d2;
-        *d2++    = tmp;
-    }
-}
-
 struct Vector {
     size_t length;
     void*  data;
@@ -141,7 +131,7 @@ static int vector_swap_remove(struct Vector* vec, size_t index, size_t size) {
         // Swap with the last item
         size_t remove_offset = index * size;
         size_t end_offset    = vec->length * size - size;
-        memswap(data + remove_offset, data + end_offset, size);
+        memcpy(data + remove_offset, data + end_offset, size);
         status = 1;
     }
 
