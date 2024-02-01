@@ -1240,6 +1240,8 @@ static int server_free_client(struct ServerContext* server, size_t index) {
         if (client->pollfd_idx < end_pollfd_idx) {
             // Update potentially swapped pollfd indexes
             for (size_t idx = 0; idx < server->clients.length; idx++) {
+                if (idx == index)
+                    continue;
                 struct ClientContext* other_client = vector_get(
                     &server->clients, idx, sizeof(struct ClientContext));
                 if (other_client->pollfd_idx == end_pollfd_idx) {
