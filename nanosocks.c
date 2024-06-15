@@ -795,7 +795,6 @@ static int client_ctx_splice_remote(struct ClientContext* client,
     /* If we failed to send in_pipe to the client,
      * then do it when send will be available */
     if (client->in_pipe_size > 0) {
-        printf("send %zu\n", client->in_pipe_size);
         pollfd->events |= POLLOUT;
     }
 
