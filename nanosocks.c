@@ -347,8 +347,8 @@ static int client_ctx_on_recv(struct ClientContext*         client,
             // Recv directly to the ring buffer
             read =
                 recv_all(client->sock,
-                              (char*)client->out_queue.data + client->out_queue.tail,
-                              to_read, 0);
+                         (char*)client->out_queue.data + client->out_queue.tail,
+                         to_read, 0);
 
             if (read > 0)
                 ring_buffer_grow(&client->out_queue, read);
@@ -818,7 +818,7 @@ static int client_ctx_on_remote_recv(struct ClientContext* client,
             client_ctx_get_address(client, address, sizeof(address));
 
             printf("%-21s [%-13s]: IN buffer is full\n", address,
-                        client_ctx_state(client));
+                   client_ctx_state(client));
         }
 
         // Don't accept more data from the remote
@@ -836,8 +836,8 @@ static int client_ctx_on_remote_recv(struct ClientContext* client,
     if (is_trivially_allocatable) {
         // Recv directly to the ring buffer
         read = recv_all(client->remote_sock,
-                             (char*)client->in_queue.data + client->in_queue.tail,
-                             to_recv, 0);
+                        (char*)client->in_queue.data + client->in_queue.tail,
+                        to_recv, 0);
         if (read > 0)
             ring_buffer_grow(&client->in_queue, read);
     } else {
@@ -852,7 +852,7 @@ static int client_ctx_on_remote_recv(struct ClientContext* client,
             char address[64];
             client_ctx_get_address(client, address, sizeof(address));
             fprintf(stderr, "%-21s [%-13s]: Remote recv failed: %s\n", address,
-                         client_ctx_state(client), strerror(errno));
+                    client_ctx_state(client), strerror(errno));
             return -1;
         }
 
@@ -867,8 +867,8 @@ static int client_ctx_on_remote_recv(struct ClientContext* client,
         client_ctx_get_address(client, address, sizeof(address));
 
         printf("%-21s [%-13s]: RECV (REMOTE) << %zd |  avail=%zu sz=%zu\n",
-                    address, client_ctx_state(client), read, buffer_avail_size,
-                    ring_buffer_size(&client->in_queue));
+               address, client_ctx_state(client), read, buffer_avail_size,
+               ring_buffer_size(&client->in_queue));
     }
 
     pollfd->events |= POLLOUT;
@@ -926,8 +926,8 @@ static int client_ctx_on_send(struct ClientContext* client,
         // Send directly from the ring buffer
         sent =
             send_all(client->sock,
-                          (const char*)client->in_queue.data + client->in_queue.head,
-                          buffer_size, 0);
+                     (const char*)client->in_queue.data + client->in_queue.head,
+                     buffer_size, 0);
     } else {
         // Copy to the temp buffer
         ring_buffer_copy(&client->in_queue, buffer, to_send);
