@@ -1,4 +1,3 @@
-#define NS_SPLICE
 #ifdef NS_SPLICE
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
