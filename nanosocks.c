@@ -873,31 +873,6 @@ static int client_ctx_on_send(struct ClientContext* client,
                               struct pollfd*        pollfd,
                               struct pollfd*        remote_pollfd) {
 #ifdef NS_SPLICE
-    size_t buffer_size = client->in_pipe_size;
-#else
-    char   buffer[CLIENT_BUFFER_SIZE];
-    size_t buffer_size = ring_buffer_size(&client->in_queue);
-#endif
-    // TODO: Is this needed with splice
-    if (UNLIKELY(buffer_size == 0)) {
-        // Wait for everything to be sent, then disconnect
-        if (client->state == CLIENT_STATE_DISCONNECTING) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
-
-            if (LOG_LEVEL >= LOG_LEVEL_INFO)
-                printf("%s [DISCONNECTING]: Disconnecting\n", address);
-
-            return -1;
-        }
-
-        // There is nothing to send to the client
-        pollfd->events &= ~POLLOUT;
-
-        return 0;
-    }
-
-#ifdef NS_SPLICE
     if (client_ctx_splice_remote_out(client) < 0)
         return -1;
 #else
@@ -951,6 +926,32 @@ static int client_ctx_on_send(struct ClientContext* client,
     if (remote_pollfd != NULL)
         remote_pollfd->events |= POLLIN;
 #endif
+
+#ifdef NS_SPLICE
+    size_t buffer_size = client->in_pipe_size;
+#else
+    char   buffer[CLIENT_BUFFER_SIZE];
+    size_t buffer_size = ring_buffer_size(&client->in_queue);
+#endif
+
+    if (buffer_size == 0) {
+        // Wait for everything to be sent, then disconnect
+        if (client->state == CLIENT_STATE_DISCONNECTING) {
+            char address[64];
+            client_ctx_get_address(client, address, sizeof(address));
+
+            if (LOG_LEVEL >= LOG_LEVEL_INFO)
+                printf("%-21s [%-13s]: Disconnecting\n", address,
+                       client_ctx_state(client));
+
+            return -1;
+        }
+
+        // There is nothing to send to the client
+        pollfd->events &= ~POLLOUT;
+
+        return 0;
+    }
 
     return 0;
 }
@@ -1179,6 +1180,36 @@ static int server_ctx_accept(struct ServerContext* server) {
     return 0;
 }
 
+static int server_free_client_remote(struct ServerContext* server,
+                                     struct ClientContext* client) {
+    close(client->remote_sock);
+
+    size_t end_pollfd_idx = server->pollfds.length - 1;
+    if (client->remote_pollfd_idx < end_pollfd_idx) {
+        // Update potentially swapped pollfd indexes
+        for (size_t idx = 0; idx < server->clients.length; idx++) {
+            struct ClientContext* other_client =
+                vector_get(&server->clients, idx, sizeof(struct ClientContext));
+            if (other_client->pollfd_idx == end_pollfd_idx) {
+                other_client->pollfd_idx = client->remote_pollfd_idx;
+                break;
+            }
+
+            if (other_client->remote_pollfd_idx == end_pollfd_idx) {
+                other_client->remote_pollfd_idx = client->remote_pollfd_idx;
+                break;
+            }
+        }
+    }
+
+    if (vector_swap_remove(&server->pollfds, client->remote_pollfd_idx,
+                           sizeof(struct pollfd)) < 0) {
+        return -1;
+    }
+
+    return 0;
+}
+
 static int server_free_client(struct ServerContext* server, size_t index) {
     struct ClientContext* client =
         vector_get(&server->clients, index, sizeof(struct ClientContext));
@@ -1192,31 +1223,9 @@ static int server_free_client(struct ServerContext* server, size_t index) {
     }
 
     // Free remote socket & pollfd
-    if (client->remote_sock != INVALID_SOCKFD) {
-        close(client->remote_sock);
-
-        size_t end_pollfd_idx = server->pollfds.length - 1;
-        if (client->remote_pollfd_idx < end_pollfd_idx) {
-            // Update potentially swapped pollfd indexes
-            for (size_t idx = 0; idx < server->clients.length; idx++) {
-                struct ClientContext* other_client = vector_get(
-                    &server->clients, idx, sizeof(struct ClientContext));
-                if (other_client->pollfd_idx == end_pollfd_idx) {
-                    other_client->pollfd_idx = client->remote_pollfd_idx;
-                    break;
-                }
-
-                if (other_client->remote_pollfd_idx == end_pollfd_idx) {
-                    other_client->remote_pollfd_idx = client->remote_pollfd_idx;
-                    break;
-                }
-            }
-        }
-
-        if (vector_swap_remove(&server->pollfds, client->remote_pollfd_idx,
-                               sizeof(struct pollfd)) < 0) {
-            return -1;
-        }
+    if (client->remote_pollfd_idx != INVALID_POLLFD &&
+        server_free_client_remote(server, client) < 0) {
+        return -1;
     }
 
     // Free client socket & pollfd
@@ -1392,7 +1401,7 @@ int main(int argc, char* argv[]) {
                     continue;
                 }
 
-                // client_ctx_on_recv may realloc server_ctx->pollfds
+                // NOTE: client_ctx_on_recv may realloc server_ctx->pollfds
                 if (client->state == CLIENT_STATE_WAIT_CONNECT) {
                     pollfd = vector_get(&server.pollfds, client->pollfd_idx,
                                         sizeof(struct pollfd));
@@ -1427,11 +1436,17 @@ int main(int argc, char* argv[]) {
                 continue;
             }
 
-            if (UNLIKELY(remote_revents & (POLLHUP | POLLERR) &&
-                         client_ctx_on_remote_hup(client) < 0)) {
-                if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                    printf("Freeing client: on_remote_hup failed\n");
-                server_free_client(&server, idx);
+            if (UNLIKELY(remote_revents & (POLLHUP | POLLERR))) {
+                if (client_ctx_on_remote_hup(client) < 0) {
+                    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+                        printf("Freeing client: on_remote_hup failed\n");
+                    server_free_client(&server, idx);
+                } else {
+                    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+                        printf("Freeing remote: on_remote_hup succeeded\n");
+                    server_free_client_remote(&server, client);
+                }
+
                 continue;
             }
 
