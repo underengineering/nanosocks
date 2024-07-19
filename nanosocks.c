@@ -313,7 +313,7 @@ static int client_ctx_on_recv(struct ClientContext* client, int epoll_fd,
         return 0;
     }
 
-    char    buffer[CLIENT_BUFFER_SIZE];
+    char    buffer[1024];
     ssize_t read = 0;
     do {
         ssize_t read_chunk =
@@ -663,6 +663,14 @@ static int client_ctx_on_recv(struct ClientContext* client, int epoll_fd,
                     sizeof(client->remote_sin));
         if (status < 0 && errno != EINPROGRESS && errno != EAGAIN) {
             perror("Connect failed");
+            close(remote_sock);
+            return -1;
+        }
+
+        // Disable nagle algorithm
+        if (setsockopt(remote_sock, IPPROTO_TCP, TCP_NODELAY, &(int){1},
+                       sizeof(int)) < 0) {
+            perror("setsockopt TCP_NODELAY");
             close(remote_sock);
             return -1;
         }
@@ -1057,7 +1065,6 @@ static void server_ctx_free(struct ServerContext* server) {
             struct ListNode*      next   = client_node->next;
             struct ClientContext* client = list_node_data(client_node);
 
-            printf("FREEING %p\n", (void*)client);
             client_ctx_free(client);
 
             free(client_node);
