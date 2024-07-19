@@ -147,23 +147,25 @@ static int client_ctx_write_in_queue(struct ClientContext* client,
 }
 
 static int client_ctx_on_hup(struct ClientContext* client) {
-    char address[64];
-    client_ctx_get_address(client, address, sizeof(address));
+    if (LOG_LEVEL >= LOG_LEVEL_INFO) {
+        char address[64];
+        client_ctx_get_address(client, address, sizeof(address));
 
-    if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("%-21s [%-13s]: Disconnected\n", address,
                client_ctx_state(client));
+    }
 
     return -1;
 }
 
 static int client_ctx_on_remote_hup(struct ClientContext* client) {
-    char address[64];
-    client_ctx_get_address(client, address, sizeof(address));
+    if (LOG_LEVEL >= LOG_LEVEL_INFO) {
+        char address[64];
+        client_ctx_get_address(client, address, sizeof(address));
 
-    if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("%-21s [%-13s]: Remote disconnected\n", address,
                client_ctx_state(client));
+    }
 
     if (client->state == CLIENT_STATE_WAIT_CONNECT) {
         char response[4 + 4 + 2];
