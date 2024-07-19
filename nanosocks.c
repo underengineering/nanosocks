@@ -1,8 +1,5 @@
-#ifdef NS_SPLICE
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
-#include <sys/fcntl.h>
-#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -16,16 +13,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/fcntl.h>
 #include <unistd.h>
 
 #include "nanosocks.h"
 
-#ifdef NS_SPLICE
-static const size_t CLIENT_BUFFER_SIZE = 2048;
-#else
-static const size_t CLIENT_RING_BUFFER_SIZE = 4096;
-static const size_t CLIENT_BUFFER_SIZE      = 2048;
-#endif
+static const size_t CLIENT_BUFFER_SIZE = 0xffff;
 
 enum LogLevel {
     LOG_LEVEL_ERROR   = 0,
@@ -51,44 +45,51 @@ enum ClientState {
 };
 
 struct ClientContext {
-    enum ClientState state;
+    enum ClientState              state;
 
-#ifdef NS_SPLICE
-    int    in_pipe[2];
-    size_t in_pipe_size;
+    int                           in_pipe[2];
+    size_t                        in_pipe_size;
 
-    int    out_pipe[2];
-    size_t out_pipe_size;
-#else
-    struct RingBuffer in_queue;
-    struct RingBuffer out_queue;
-#endif
+    int                           out_pipe[2];
+    size_t                        out_pipe_size;
 
-    struct sockaddr_in sin;
-    struct sockaddr_in remote_sin;
+    struct sockaddr_in            sin;
+    struct sockaddr_in            remote_sin;
 
-    int                sock;
-    int                remote_sock;
+    int                           sock;
+    int                           remote_sock;
 
-    size_t             pollfd_idx;
-    size_t             remote_pollfd_idx;
+    struct ClientContextPollData* poll_data;
+    int                           interests;
+
+    struct ClientContextPollData* remote_poll_data;
+    int                           remote_interests;
+
+    bool                          ready;
+};
+
+struct ClientContextPollData {
+    struct ClientContext* client;
+    int                   events;
 };
 
 static void client_ctx_init(struct ClientContext* client) {
     client->state = CLIENT_STATE_WAIT_GREET;
 
-    client->remote_sock       = INVALID_SOCKFD;
-    client->remote_pollfd_idx = INVALID_POLLFD;
+    client->remote_sock = INVALID_SOCKFD;
 
-#ifdef NS_SPLICE
     pipe((int*)&client->in_pipe);
     pipe((int*)&client->out_pipe);
 
     client->in_pipe_size = client->out_pipe_size = 0;
-#else
-    ring_buffer_init(&client->in_queue, CLIENT_RING_BUFFER_SIZE);
-    ring_buffer_init(&client->out_queue, CLIENT_RING_BUFFER_SIZE);
-#endif
+
+    client->poll_data = NULL;
+    client->interests = 0;
+
+    client->remote_poll_data = NULL;
+    client->remote_interests = 0;
+
+    client->ready = false;
 }
 
 static const char* client_ctx_state(struct ClientContext* client) {
@@ -131,7 +132,6 @@ static void client_ctx_get_remote_address(struct ClientContext* client,
 
 static int client_ctx_write_in_queue(struct ClientContext* client,
                                      const void* data, size_t size) {
-#ifdef NS_SPLICE
     ssize_t sent = write(client->in_pipe[1], data, size);
     if (sent < 0) {
         perror("Write failed");
@@ -140,10 +140,6 @@ static int client_ctx_write_in_queue(struct ClientContext* client,
 
     client->in_pipe_size += sent;
     return (size_t)sent;
-#else
-    ring_buffer_fill(&client->in_queue, data, size);
-    return size;
-#endif
 }
 
 static int client_ctx_on_hup(struct ClientContext* client) {
@@ -167,6 +163,13 @@ static int client_ctx_on_remote_hup(struct ClientContext* client) {
                client_ctx_state(client));
     }
 
+    // Close sock to remove it from epoll
+    close(client->remote_sock);
+    client->remote_sock = INVALID_SOCKFD;
+
+    // Will be removed in server_free_client
+    client->remote_poll_data->events = 0;
+
     if (client->state == CLIENT_STATE_WAIT_CONNECT) {
         char response[4 + 4 + 2];
         response[0]              = 0x05;                               //ver
@@ -183,14 +186,11 @@ static int client_ctx_on_remote_hup(struct ClientContext* client) {
         return 0;
     }
 
-#ifdef NS_SPLICE
     size_t buffer_size = client->in_pipe_size;
-#else
-    size_t buffer_size = ring_buffer_size(&client->in_queue);
-#endif
 
     // Still need to send the rest of the data
     if (buffer_size > 0) {
+        printf("BUFFER SIZE IS %zu\n", buffer_size);
         client->state = CLIENT_STATE_DISCONNECTING;
         return 0;
     }
@@ -235,18 +235,23 @@ struct Socks5ConnRequestHeader {
 };
 
 static void client_ctx_free(struct ClientContext* client) {
-#ifdef NS_SPLICE
+    // Close sockets
+    close(client->sock);
+    if (client->remote_sock != INVALID_SOCKFD)
+        close(client->remote_sock);
+
+    // Free poll data
+    if (client->poll_data != NULL)
+        free(list_node_from_data(client->poll_data));
+    if (client->remote_poll_data != NULL)
+        free(list_node_from_data(client->remote_poll_data));
+
     close(client->in_pipe[0]);
     close(client->in_pipe[1]);
     close(client->out_pipe[0]);
     close(client->out_pipe[1]);
-#else
-    ring_buffer_free(&client->in_queue);
-    ring_buffer_free(&client->out_queue);
-#endif
 }
 
-#ifdef NS_SPLICE
 static int client_ctx_splice_in(struct ClientContext* client) {
     ssize_t read =
         splice(client->sock, NULL, client->out_pipe[1], NULL,
@@ -259,6 +264,8 @@ static int client_ctx_splice_in(struct ClientContext* client) {
                     client_ctx_state(client), strerror(errno));
             return -1;
         }
+
+        client->poll_data->events &= ~EPOLLIN;
 
         return 0;
     }
@@ -274,7 +281,7 @@ static int client_ctx_splice_in(struct ClientContext* client) {
 static int client_ctx_splice_out(struct ClientContext* client) {
     ssize_t sent =
         splice(client->out_pipe[0], NULL, client->remote_sock, NULL,
-               CLIENT_BUFFER_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+               client->out_pipe_size, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (sent < 0) {
         if (errno != EAGAIN) {
             char address[64];
@@ -284,6 +291,8 @@ static int client_ctx_splice_out(struct ClientContext* client) {
             return -1;
         }
 
+        client->remote_poll_data->events &= ~EPOLLOUT;
+
         return 0;
     }
 
@@ -292,108 +301,48 @@ static int client_ctx_splice_out(struct ClientContext* client) {
     return 0;
 }
 
-#endif
-
-static int client_ctx_on_recv(struct ClientContext*         client,
-                              struct Vector*                pollfds,
-                              struct AuthenticationContext* auth_ctx,
-                              struct pollfd*                pollfd,
-                              struct pollfd*                remote_pollfd) {
-#ifdef NS_SPLICE
+static int client_ctx_on_recv(struct ClientContext* client, int epoll_fd,
+                              struct AuthenticationContext* auth_ctx) {
     if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
         if (client_ctx_splice_in(client) < 0)
             return -1;
 
         if (client->out_pipe_size > 0)
-            remote_pollfd->events |= POLLOUT;
+            client->remote_interests |= EPOLLOUT;
 
         return 0;
     }
-#endif
 
-    char buffer[CLIENT_BUFFER_SIZE];
-#ifndef NS_SPLICE
-    size_t buffer_avail_size =
-        client->out_queue.capacity - ring_buffer_size(&client->out_queue);
-    if (UNLIKELY(buffer_avail_size <= 1)) {
-        // Out buffer is full
+    char    buffer[CLIENT_BUFFER_SIZE];
+    ssize_t read = 0;
+    do {
+        ssize_t read_chunk =
+            recv(client->sock, (char*)buffer + read, sizeof(buffer) - read, 0);
+        if (read_chunk < 0) {
+            if (errno != EAGAIN) {
+                char address[64];
+                client_ctx_get_address(client, address, sizeof(address));
+                fprintf(stderr, "%-21s [%-13s]: Recv failed: %s\n", address,
+                        client_ctx_state(client), strerror(errno));
+                return -1;
+            }
 
-        if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
+            client->poll_data->events &= ~EPOLLIN;
 
-            printf("%-21s [%-13s]: OUT buffer is full\n", address,
-                   client_ctx_state(client));
+            if (read == 0)
+                return 0;
+
+            break;
         }
 
-        // Don't accept more data from the client
-        pollfd->events &= ~POLLIN;
+        if (read_chunk == 0)
+            break;
 
-        return 0;
-    }
-#endif
-
-    ssize_t read;
-#ifdef NS_SPLICE
-    read = recv_all(client->sock, buffer, sizeof(buffer), 0);
-#else
-    size_t to_read = MIN(buffer_avail_size - 1, sizeof(buffer));
-    if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
-        // Use ring buffer when streaming
-        bool is_trivially_allocatable =
-            ring_buffer_is_trivially_allocatable(&client->out_queue, to_read);
-        if (is_trivially_allocatable) {
-            // Recv directly to the ring buffer
-            read =
-                recv_all(client->sock,
-                         (char*)client->out_queue.data + client->out_queue.tail,
-                         to_read, 0);
-
-            if (read > 0)
-                ring_buffer_grow(&client->out_queue, read);
-        } else {
-            // Recv to the temp buffer
-            read = recv_all(client->sock, buffer, to_read, 0);
-
-            // Fill ring buffer with temp buffer
-            if (read > 0)
-                ring_buffer_fill(&client->out_queue, buffer, read);
-        }
-    } else {
-        // Use stack buffer
-        read = recv_all(client->sock, buffer, to_read, 0);
-    }
-#endif
-
-    if (read < 0) {
-        if (errno != EAGAIN) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
-            fprintf(stderr, "%-21s [%-13s]: Recv failed: %s\n", address,
-                    client_ctx_state(client), strerror(errno));
-            return -1;
-        }
-
-        return 0;
-    }
+        read += read_chunk;
+    } while ((size_t)read < sizeof(buffer));
 
     if (read == 0)
         return client_ctx_on_hup(client);
-
-#ifndef NS_SPLICE
-    if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
-        if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
-            printf("%-21s [%-13s]: RECV << %zd\n", address,
-                   client_ctx_state(client), read);
-        }
-
-        remote_pollfd->events |= POLLOUT;
-
-        return 0;
-    }
-#endif
 
     if (client->state == CLIENT_STATE_WAIT_GREET) {
         char address[64];
@@ -454,7 +403,6 @@ static int client_ctx_on_recv(struct ClientContext*         client,
             uint8_t response[2] = {0x05, AUTH_METHOD_USER_PASS};
             client_ctx_write_in_queue(client, response, sizeof(response));
 
-            pollfd->events |= POLLOUT;
             client->state = CLIENT_STATE_WAIT_AUTH;
         } else {
             if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
@@ -464,9 +412,10 @@ static int client_ctx_on_recv(struct ClientContext*         client,
             uint8_t response[2] = {0x05, AUTH_METHOD_NO_AUTH};
             client_ctx_write_in_queue(client, response, sizeof(response));
 
-            pollfd->events |= POLLOUT;
             client->state = CLIENT_STATE_WAIT_REQUEST;
         }
+
+        client->interests |= EPOLLOUT;
     } else if (client->state == CLIENT_STATE_WAIT_AUTH) {
         char address[64];
         client_ctx_get_address(client, address, sizeof(address));
@@ -538,8 +487,8 @@ static int client_ctx_on_recv(struct ClientContext*         client,
         uint8_t response[2] = {0x01, 0x00};
         client_ctx_write_in_queue(client, response, sizeof(response));
 
-        pollfd->events |= POLLOUT;
-        client->state = CLIENT_STATE_WAIT_REQUEST;
+        client->interests = EPOLLOUT;
+        client->state     = CLIENT_STATE_WAIT_REQUEST;
     } else if (client->state == CLIENT_STATE_WAIT_REQUEST) {
         char address[64];
         client_ctx_get_address(client, address, sizeof(address));
@@ -582,8 +531,8 @@ static int client_ctx_on_recv(struct ClientContext*         client,
             *(uint16_t*)&response[4 + 4] = 0;                  //port
             client_ctx_write_in_queue(client, response, sizeof(response));
 
-            pollfd->events |= POLLOUT;
-            client->state = CLIENT_STATE_DISCONNECTING;
+            client->interests = EPOLLOUT;
+            client->state     = CLIENT_STATE_DISCONNECTING;
 
             if (LOG_LEVEL >= LOG_LEVEL_WARNING)
                 fprintf(stderr,
@@ -649,8 +598,8 @@ static int client_ctx_on_recv(struct ClientContext*         client,
                 *(uint16_t*)&response[4 + 4] = htons(remote_port); //port
                 client_ctx_write_in_queue(client, response, sizeof(response));
 
-                pollfd->events |= POLLOUT;
-                client->state = CLIENT_STATE_DISCONNECTING;
+                client->interests = EPOLLOUT;
+                client->state     = CLIENT_STATE_DISCONNECTING;
 
                 perror("getaddrinfo failed");
                 return 0;
@@ -679,8 +628,8 @@ static int client_ctx_on_recv(struct ClientContext*         client,
                 *(uint16_t*)&response[4 + 4] = htons(remote_port); //port
                 client_ctx_write_in_queue(client, response, sizeof(response));
 
-                pollfd->events |= POLLOUT;
-                client->state = CLIENT_STATE_DISCONNECTING;
+                client->interests = EPOLLOUT;
+                client->state     = CLIENT_STATE_DISCONNECTING;
 
                 if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                     printf("%-21s [%-13s]: Failed to resolve %s\n", address,
@@ -714,25 +663,27 @@ static int client_ctx_on_recv(struct ClientContext*         client,
                     sizeof(client->remote_sin));
         if (status < 0 && errno != EINPROGRESS && errno != EAGAIN) {
             perror("Connect failed");
+            close(remote_sock);
             return -1;
         }
 
-        struct pollfd remote_pollfd;
-        remote_pollfd.fd = remote_sock;
+        struct ClientContextPollData* poll_data = client->remote_poll_data;
 
-        // POLLOUT should be on until connection is made
-        remote_pollfd.events  = POLLIN | POLLOUT;
-        remote_pollfd.revents = 0;
+        // EPOLLOUT should be on until connection is made
+        struct epoll_event event;
+        event.events   = EPOLLIN | EPOLLOUT | EPOLLET;
+        event.data.ptr = poll_data;
 
-        client->remote_sock       = remote_sock;
-        client->remote_pollfd_idx = pollfds->length;
-        if (vector_push(pollfds, &remote_pollfd, sizeof(remote_pollfd)) < 0) {
-            perror("Remote socket pollfd allocation failed");
+        if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, remote_sock, &event) < 0) {
+            perror("epoll_ctl failed");
+            close(remote_sock);
             return -1;
         }
 
-        // Wait for remote connection first
-        pollfd->events &= ~POLLIN;
+        client->remote_sock = remote_sock;
+
+        client->interests        = 0;
+        client->remote_interests = EPOLLOUT;
 
         client->state = CLIENT_STATE_WAIT_CONNECT;
     }
@@ -740,7 +691,6 @@ static int client_ctx_on_recv(struct ClientContext*         client,
     return 0;
 }
 
-#ifdef NS_SPLICE
 static int client_ctx_splice_remote_in(struct ClientContext* client) {
     ssize_t read =
         splice(client->remote_sock, NULL, client->in_pipe[1], NULL,
@@ -753,6 +703,8 @@ static int client_ctx_splice_remote_in(struct ClientContext* client) {
                     client_ctx_state(client), strerror(errno));
             return -1;
         }
+
+        client->remote_poll_data->events &= ~EPOLLIN;
 
         return 0;
     }
@@ -778,6 +730,8 @@ static int client_ctx_splice_remote_out(struct ClientContext* client) {
             return -1;
         }
 
+        client->poll_data->events &= ~EPOLLOUT;
+
         return 0;
     }
 
@@ -785,154 +739,22 @@ static int client_ctx_splice_remote_out(struct ClientContext* client) {
 
     return 0;
 }
-#endif
 
-static int client_ctx_on_remote_recv(struct ClientContext* client,
-                                     struct pollfd*        pollfd,
-                                     struct pollfd*        remote_pollfd) {
-#ifdef NS_SPLICE
-    (void)remote_pollfd;
-
+static int client_ctx_on_remote_recv(struct ClientContext* client) {
     if (client_ctx_splice_remote_in(client) < 0)
         return -1;
 
     if (client->in_pipe_size > 0)
-        pollfd->events |= POLLOUT;
+        client->interests |= EPOLLOUT;
 
     return 0;
-#else
-    size_t buffer_avail_size =
-        client->in_queue.capacity - ring_buffer_size(&client->in_queue);
-    if (UNLIKELY(buffer_avail_size <= 1)) {
-        // In buffer is full
-        if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
-
-            printf("%-21s [%-13s]: IN buffer is full\n", address,
-                   client_ctx_state(client));
-        }
-
-        // Don't accept more data from the remote
-        remote_pollfd->events &= ~POLLIN;
-
-        return 0;
-    }
-
-    char    buffer[CLIENT_BUFFER_SIZE];
-    size_t  to_recv = MIN(buffer_avail_size - 1, sizeof(buffer));
-
-    ssize_t read;
-    bool    is_trivially_allocatable =
-        ring_buffer_is_trivially_allocatable(&client->in_queue, to_recv);
-    if (is_trivially_allocatable) {
-        // Recv directly to the ring buffer
-        read = recv_all(client->remote_sock,
-                        (char*)client->in_queue.data + client->in_queue.tail,
-                        to_recv, 0);
-        if (read > 0)
-            ring_buffer_grow(&client->in_queue, read);
-    } else {
-        // Recv to the temp buffer
-        read = recv_all(client->remote_sock, buffer, to_recv, 0);
-        if (read > 0)
-            ring_buffer_fill(&client->in_queue, buffer, read);
-    }
-
-    if (read < 0) {
-        if (errno != EAGAIN) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
-            fprintf(stderr, "%-21s [%-13s]: Remote recv failed: %s\n", address,
-                    client_ctx_state(client), strerror(errno));
-            return -1;
-        }
-
-        return 0;
-    }
-
-    if (read == 0)
-        return client_ctx_on_remote_hup(client);
-
-    if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
-        char address[64];
-        client_ctx_get_address(client, address, sizeof(address));
-
-        printf("%-21s [%-13s]: RECV (REMOTE) << %zd |  avail=%zu sz=%zu\n",
-               address, client_ctx_state(client), read, buffer_avail_size,
-               ring_buffer_size(&client->in_queue));
-    }
-
-    pollfd->events |= POLLOUT;
-
-    return 0;
-#endif
 }
 
-static int client_ctx_on_send(struct ClientContext* client,
-                              struct pollfd*        pollfd,
-                              struct pollfd*        remote_pollfd) {
-#ifdef NS_SPLICE
-    if (client_ctx_splice_remote_out(client) < 0)
+static int client_ctx_on_send(struct ClientContext* client) {
+    if (client->in_pipe_size > 0 && client_ctx_splice_remote_out(client) < 0)
         return -1;
-#else
-    ssize_t sent    = 0;
-    size_t  to_send = MIN(buffer_size, sizeof(buffer));
-    if (ring_buffer_is_trivially_copyable(&client->in_queue, buffer_size)) {
-        // Send directly from the ring buffer
-        sent =
-            send_all(client->sock,
-                     (const char*)client->in_queue.data + client->in_queue.head,
-                     buffer_size, 0);
-    } else {
-        // Copy to the temp buffer
-        ring_buffer_copy(&client->in_queue, buffer, to_send);
-        sent = send_all(client->sock, buffer, to_send, 0);
-    }
-#endif
 
-#ifndef NS_SPLICE
-    if (sent < 0) {
-        if (errno != EAGAIN) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
-            fprintf(stderr, "%-21s [%-13s]: Send failed: %s\n", address,
-                    client_ctx_state(client), strerror(errno));
-            return -1;
-        }
-
-        return 0;
-    }
-
-    if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
-        char address[64];
-        client_ctx_get_address(client, address, sizeof(address));
-
-        printf("%-21s [%-13s]: SEND >> %zu | sent=%zd\n", address,
-               client_ctx_state(client), to_send, sent);
-    }
-#endif
-
-    // We sent all data in the buffer
-#ifdef NS_SPLICE
-    if (client->in_pipe_size == 0)
-        pollfd->events &= ~POLLOUT;
-#else
-    ring_buffer_shrink(&client->in_queue, sent);
-    if ((size_t)sent == buffer_size)
-        pollfd->events &= ~POLLOUT;
-
-    // We freed some space in the buffer
-    if (remote_pollfd != NULL)
-        remote_pollfd->events |= POLLIN;
-#endif
-
-#ifdef NS_SPLICE
     size_t buffer_size = client->in_pipe_size;
-#else
-    char   buffer[CLIENT_BUFFER_SIZE];
-    size_t buffer_size = ring_buffer_size(&client->in_queue);
-#endif
 
     if (buffer_size == 0) {
         // Wait for everything to be sent, then disconnect
@@ -948,28 +770,22 @@ static int client_ctx_on_send(struct ClientContext* client,
         }
 
         // There is nothing to send to the client
-        pollfd->events &= ~POLLOUT;
-
-        return 0;
+        client->interests &= ~EPOLLOUT;
     }
 
     return 0;
 }
 
-static int client_ctx_on_remote_send(struct ClientContext* client,
-                                     struct pollfd*        pollfd,
-                                     struct pollfd*        remote_pollfd) {
-#ifdef NS_SPLICE
+static int client_ctx_on_remote_send(struct ClientContext* client) {
     if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
-        if (client_ctx_splice_out(client) < 0)
+        if (client->out_pipe_size > 0 && client_ctx_splice_out(client) < 0)
             return -1;
 
         if (client->out_pipe_size == 0)
-            remote_pollfd->events &= ~POLLOUT;
+            client->remote_interests &= ~EPOLLOUT;
 
         return 0;
     }
-#endif
 
     if (UNLIKELY(client->state == CLIENT_STATE_WAIT_CONNECT)) {
         char response[4 + 4 + 2];
@@ -980,13 +796,6 @@ static int client_ctx_on_remote_send(struct ClientContext* client,
         *(uint32_t*)&response[4] = client->remote_sin.sin_addr.s_addr; //addr
         *(uint16_t*)&response[4 + 4] = client->remote_sin.sin_port;    //port
         client_ctx_write_in_queue(client, response, sizeof(response));
-
-#ifdef NS_SPLICE
-        pollfd->events        = POLLOUT | POLLIN;
-        remote_pollfd->events = POLLIN;
-#else
-        pollfd->events = POLLIN | POLLOUT;
-#endif
 
         // Enable nagle algorithm back
         if (setsockopt(client->sock, IPPROTO_TCP, TCP_NODELAY, &(int){0},
@@ -1003,72 +812,26 @@ static int client_ctx_on_remote_send(struct ClientContext* client,
                    client_ctx_state(client));
         }
 
+        // Start proxying
+        client->interests        = EPOLLOUT | EPOLLIN;
+        client->remote_interests = EPOLLIN;
+
         client->state = CLIENT_STATE_STREAMING;
     }
 
-#ifndef NS_SPLICE
-    size_t buffer_size = ring_buffer_size(&client->out_queue);
-    if (UNLIKELY(buffer_size == 0)) {
-        // There is nothing to send to the remote
-        if (client->state == CLIENT_STATE_STREAMING)
-            remote_pollfd->events &= ~POLLOUT;
-
-        return 0;
-    }
-
-    char    buffer[CLIENT_BUFFER_SIZE];
-    size_t  to_send = MIN(buffer_size, sizeof(buffer));
-
-    ssize_t sent;
-    if (ring_buffer_is_trivially_copyable(&client->out_queue, to_send)) {
-        sent = send_all(client->remote_sock,
-                        (const char*)client->out_queue.data +
-                            client->out_queue.head,
-                        to_send, 0);
-    } else {
-        ring_buffer_copy(&client->out_queue, buffer, to_send);
-        sent = send_all(client->remote_sock, buffer, to_send, 0);
-    }
-
-    if (sent < 0) {
-        if (errno != EAGAIN) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
-            fprintf(stderr, "%-21s [%-13s]: Remote send failed: %s\n", address,
-                    client_ctx_state(client), strerror(errno));
-            return -1;
-        }
-
-        return 0;
-    }
-
-    if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
-        char address[64];
-        client_ctx_get_address(client, address, sizeof(address));
-
-        printf("%-21s [%-13s]: SEND (REMOTE) >> %zu | sent=%zd\n", address,
-               client_ctx_state(client), to_send, sent);
-    }
-
-    ring_buffer_shrink(&client->out_queue, to_send);
-
-    // We sent all data in the buffer
-    if ((size_t)sent == buffer_size)
-        remote_pollfd->events &= ~POLLOUT;
-
-    // We freed some space in the buffer
-    pollfd->events |= POLLIN;
-
     return 0;
-#else
-    return 0;
-#endif
 }
 
 struct ServerContext {
-    int           server_sock;
-    struct Vector pollfds;
-    struct Vector clients;
+    int         server_sock;
+    int         events;
+
+    int         epoll_fd;
+
+    struct List clients;
+    struct List poll_data_list;
+    struct List ready_clients;
+    size_t      ready_clients_count;
 };
 
 static int server_ctx_init(struct ServerContext* server, uint16_t port) {
@@ -1102,15 +865,22 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
         }
     }
 
-    vector_init(&server->pollfds, 0, 0);
-    vector_init(&server->clients, 0, 0);
+    server->events = 0;
 
-    // Create server pollfd
-    struct pollfd pollfd;
-    pollfd.fd     = server_sock;
-    pollfd.events = POLLIN;
-    if (vector_push(&server->pollfds, &pollfd, sizeof(struct pollfd)) < 0) {
-        perror("Failed to push server pollfd");
+    list_init(&server->clients);
+    list_init(&server->ready_clients);
+    list_init(&server->poll_data_list);
+    server->ready_clients_count = 0;
+
+    server->epoll_fd = epoll_create1(0);
+
+    // Add server pollfd
+    struct epoll_event event;
+    event.events   = EPOLLIN | EPOLLET;
+    event.data.ptr = server;
+
+    if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, server_sock, &event) < 0) {
+        perror("epoll_ctl failed");
         return -1;
     }
 
@@ -1118,35 +888,48 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
 }
 
 static int server_ctx_accept(struct ServerContext* server) {
-    // Allocate a new client
-    struct ClientContext* client =
-        vector_alloc(&server->clients, sizeof(struct ClientContext));
-    if (client == NULL) {
-        perror("Failed to allocate a ClientContext");
-        return -1;
-    }
-
-    client_ctx_init(client);
 
     // Accept socket
-    socklen_t sin_length  = sizeof(client->sin);
-    int       client_sock = accept(server->server_sock,
-                                   (struct sockaddr*)&client->sin, &sin_length);
-    client->sock          = client_sock;
+    struct sockaddr_in sin;
+    socklen_t          sin_length = sizeof(sin);
+    int                client_sock =
+        accept(server->server_sock, (struct sockaddr*)&sin, &sin_length);
     if (client_sock < 0) {
-        perror("Accept failed");
+        if (errno != EAGAIN) {
+            perror("Accept failed");
+            return -1;
+        }
+
+        server->events = 0;
+
+        return 0;
+    }
+
+    // Allocate a new client
+    struct ListNode* client_node =
+        list_alloc(&server->clients, sizeof(struct ClientContext));
+    if (client_node == NULL) {
+        perror("Failed to allocate a ClientContext node");
         return -1;
     }
+
+    struct ClientContext* client = list_node_data(client_node);
+    client_ctx_init(client);
+
+    client->sock = client_sock;
+    memcpy(&client->sin, &sin, sizeof(sin));
 
     // Make it non-blocking
     int flags = fcntl(client_sock, F_GETFL);
     if (flags < 0) {
         perror("F_GETFL failed");
+        close(client_sock);
         return -1;
     }
 
     if (fcntl(client_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
         perror("F_SETFL O_NONBLOCK failed");
+        close(client_sock);
         return -1;
     }
 
@@ -1154,6 +937,7 @@ static int server_ctx_accept(struct ServerContext* server) {
     if (setsockopt(client->sock, IPPROTO_TCP, TCP_NODELAY, &(int){1},
                    sizeof(int)) < 0) {
         perror("setsockopt TCP_NODELAY");
+        close(client_sock);
         return -1;
     }
 
@@ -1161,119 +945,127 @@ static int server_ctx_accept(struct ServerContext* server) {
         char address[64];
         client_ctx_get_address(client, address, sizeof(address));
 
-        printf("%-21s [%-13s]: Connected #%zu\n", address,
-               client_ctx_state(client), server->clients.length);
+        printf("%-21s [%-13s]: Connected %p\n", address,
+               client_ctx_state(client), (void*)client);
     }
 
-    // Allocate a new pollfd
-    client->pollfd_idx = server->pollfds.length;
-    struct pollfd* pollfd =
-        vector_alloc(&server->pollfds, sizeof(struct pollfd));
-    if (pollfd == NULL) {
-        perror("Failed to push a new pollfd");
-        return -1;
-    }
-
-    pollfd->fd     = client_sock;
-    pollfd->events = POLLIN;
-
-    return 0;
-}
-
-static int server_free_client_remote(struct ServerContext* server,
-                                     struct ClientContext* client) {
-    close(client->remote_sock);
-
-    size_t end_pollfd_idx = server->pollfds.length - 1;
-    if (client->remote_pollfd_idx < end_pollfd_idx) {
-        // Update potentially swapped pollfd indexes
-        for (size_t idx = 0; idx < server->clients.length; idx++) {
-            struct ClientContext* other_client =
-                vector_get(&server->clients, idx, sizeof(struct ClientContext));
-            if (other_client->pollfd_idx == end_pollfd_idx) {
-                other_client->pollfd_idx = client->remote_pollfd_idx;
-                break;
-            }
-
-            if (other_client->remote_pollfd_idx == end_pollfd_idx) {
-                other_client->remote_pollfd_idx = client->remote_pollfd_idx;
-                break;
-            }
+    // Preallocate remote epoll data
+    {
+        struct ListNode* epoll_data_node = list_alloc(
+            &server->poll_data_list, sizeof(struct ClientContextPollData));
+        if (epoll_data_node == NULL) {
+            perror("Failed to allocate a ClientContextPollData node");
+            close(client_sock);
+            return -1;
         }
+
+        struct ClientContextPollData* poll_data =
+            list_node_data(epoll_data_node);
+        poll_data->client = client;
+        poll_data->events = 0;
+
+        list_append(&server->poll_data_list, epoll_data_node);
+
+        client->remote_poll_data = poll_data;
     }
 
-    if (vector_swap_remove(&server->pollfds, client->remote_pollfd_idx,
-                           sizeof(struct pollfd)) < 0) {
+    // Allocate epoll data
+    struct ListNode* epoll_data_node = list_alloc(
+        &server->poll_data_list, sizeof(struct ClientContextPollData));
+    if (epoll_data_node == NULL) {
+        perror("Failed to allocate a ClientContextPollData node");
+        close(client_sock);
         return -1;
     }
+
+    struct ClientContextPollData* poll_data = list_node_data(epoll_data_node);
+    poll_data->client                       = client;
+    poll_data->events                       = 0;
+
+    list_append(&server->poll_data_list, epoll_data_node);
+
+    client->poll_data = poll_data;
+
+    // Add to epoll fd
+    struct epoll_event event;
+    event.events   = EPOLLIN | EPOLLOUT | EPOLLET;
+    event.data.ptr = poll_data;
+
+    if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, client_sock, &event) < 0) {
+        perror("epoll_ctl failed");
+        return -1;
+    }
+
+    // Wait for command
+    client->interests |= EPOLLIN;
 
     return 0;
 }
 
-static int server_free_client(struct ServerContext* server, size_t index) {
+static int server_free_client(struct ServerContext* server,
+                              struct ListNode*      client_node) {
     struct ClientContext* client =
-        vector_get(&server->clients, index, sizeof(struct ClientContext));
+        (struct ClientContext*)list_node_data(client_node);
 
-    if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
+    if (LOG_LEVEL >= LOG_LEVEL_INFO) {
         char address[64];
         client_ctx_get_address(client, address, sizeof(address));
 
-        printf("%-21s [%-13s]: Freeing client #%zu\n", address,
-               client_ctx_state(client), index);
+        printf("%-21s [%-13s]: Freeing client %p\n", address,
+               client_ctx_state(client), (void*)client);
     }
 
-    // Free remote socket & pollfd
-    if (client->remote_pollfd_idx != INVALID_POLLFD &&
-        server_free_client_remote(server, client) < 0) {
-        return -1;
+    if (client->poll_data->events || client->remote_poll_data->events) {
+        list_remove(&server->ready_clients, client_node);
+        server->ready_clients_count--;
+    } else {
+        list_remove(&server->clients, client_node);
     }
 
-    // Free client socket & pollfd
     {
-        close(client->sock);
+        struct ListNode* poll_data_node =
+            list_node_from_data(client->poll_data);
+        list_remove(&server->poll_data_list, poll_data_node);
+    }
 
-        size_t end_pollfd_idx = server->pollfds.length - 1;
-        if (client->pollfd_idx < end_pollfd_idx) {
-            // Update potentially swapped pollfd indexes
-            for (size_t idx = 0; idx < server->clients.length; idx++) {
-                if (idx == index)
-                    continue;
-                struct ClientContext* other_client = vector_get(
-                    &server->clients, idx, sizeof(struct ClientContext));
-                if (other_client->pollfd_idx == end_pollfd_idx) {
-                    other_client->pollfd_idx = client->pollfd_idx;
-                    break;
-                }
-
-                if (other_client->remote_pollfd_idx == end_pollfd_idx) {
-                    other_client->remote_pollfd_idx = client->pollfd_idx;
-                    break;
-                }
-            }
-        }
-
-        if (vector_swap_remove(&server->pollfds, client->pollfd_idx,
-                               sizeof(struct pollfd)) < 0)
-            return -1;
+    {
+        struct ListNode* remote_poll_data_node =
+            list_node_from_data(client->remote_poll_data);
+        list_remove(&server->poll_data_list, remote_poll_data_node);
     }
 
     client_ctx_free(client);
-    if (vector_swap_remove(&server->clients, index,
-                           sizeof(struct ClientContext)) < 0)
-        return -1;
+    free(client_node);
 
     return 0;
 }
 
 static void server_ctx_free(struct ServerContext* server) {
-    for (size_t idx = 0; idx < server->clients.length; idx++) {
-        struct ClientContext* client =
-            vector_get(&server->clients, idx, sizeof(struct ClientContext));
-        client_ctx_free(client);
+    // Move everyone from ready list to clients list
+    if (server->clients.head == NULL) {
+        server->clients.head = server->ready_clients.head;
+        server->clients.tail = server->ready_clients.tail;
+    } else {
+        server->clients.tail->next = server->ready_clients.head;
+        server->clients.tail       = server->ready_clients.tail;
     }
 
-    vector_free(&server->clients);
-    vector_free(&server->pollfds);
+    // Free clients
+    {
+        struct ListNode* client_node = server->clients.head;
+        while (client_node != NULL) {
+            struct ListNode*      next   = client_node->next;
+            struct ClientContext* client = list_node_data(client_node);
+
+            printf("FREEING %p\n", (void*)client);
+            client_ctx_free(client);
+
+            free(client_node);
+            client_node = next;
+        }
+    }
+
+    close(server->epoll_fd);
     close(server->server_sock);
 }
 
@@ -1344,113 +1136,148 @@ int main(int argc, char* argv[]) {
     if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("Starting on port %hu\n", server_port);
 
+    int interests_diff = 1;
     while (!g_should_stop) {
-        struct pollfd* pollfds = (struct pollfd*)server.pollfds.data;
-        int            ready   = poll(pollfds, server.pollfds.length, 1000);
-        if (UNLIKELY(ready == 0))
-            continue;
+        struct epoll_event events[32];
+
+        int                ready = 0;
+        if (interests_diff || server.ready_clients_count == 0) {
+            int timeout    = server.ready_clients_count > 0 ? 0 : 1000;
+            ready          = epoll_wait(server.epoll_fd, events,
+                                        sizeof(events) / sizeof(*events), timeout);
+            interests_diff = 0;
+        }
+
         if (UNLIKELY(ready < 0)) {
             perror("poll failed");
             break;
         }
 
-        // Poll server
-        {
-
-            struct pollfd* pollfd = &pollfds[0];
-            if (pollfd->revents & POLLIN) {
-                server_ctx_accept(&server);
-                ready--;
+        for (size_t idx = 0; idx < (size_t)ready; idx++) {
+            struct epoll_event* event = &events[idx];
+            if (UNLIKELY(event->data.ptr == &server)) {
+                server.events = event->events;
+                continue;
             }
+
+            struct ClientContextPollData* poll_data = event->data.ptr;
+            struct ClientContext*         client    = poll_data->client;
+            struct ClientContextPollData* remote_poll_data =
+                client->remote_poll_data;
+
+#if 0
+            printf("Got event for ");
+            if (event->data.ptr == client->poll_data)
+                printf("LOCAL");
+            else
+                printf("REMOTE");
+            printf(" [ ");
+            if (event->events & EPOLLIN)
+                printf("EPOLLIN ");
+            if (event->events & EPOLLOUT)
+                printf("EPOLLOUT ");
+            if (event->events & EPOLLHUP)
+                printf("EPOLLHUP ");
+            printf("]\n");
+#endif
+
+            int interests = poll_data == remote_poll_data ?
+                client->remote_interests :
+                client->interests;
+            if (!client->ready && (events->events & interests)) {
+                // Move to ready list
+
+                struct ListNode* client_node = list_node_from_data(client);
+                list_remove(&server.clients, client_node);
+                list_append(&server.ready_clients, client_node);
+                server.ready_clients_count++;
+
+                client->ready = true;
+            }
+
+            poll_data->events = event->events;
         }
 
-        for (size_t idx = 0; idx < server.clients.length && ready > 0;) {
-            struct ClientContext* client =
-                vector_get(&server.clients, idx, sizeof(struct ClientContext));
+        if (server.events & EPOLLIN) {
+            if (server_ctx_accept(&server) < 0)
+                break;
 
-            struct pollfd* pollfd = vector_get(
-                &server.pollfds, client->pollfd_idx, sizeof(struct pollfd));
+            if (!server.events)
+                interests_diff = 1;
+        }
 
-            struct pollfd* remote_pollfd = NULL;
-            if (client->remote_pollfd_idx != INVALID_POLLFD)
-                remote_pollfd =
-                    vector_get(&server.pollfds, client->remote_pollfd_idx,
-                               sizeof(struct pollfd));
+        struct ListNode* client_node = server.ready_clients.head;
+        while (client_node != NULL) {
+            struct ListNode*              next   = client_node->next;
+            struct ClientContext*         client = list_node_data(client_node);
 
-            short remote_revents =
-                remote_pollfd != NULL ? remote_pollfd->revents : 0;
-            if (pollfd->revents)
-                ready--;
-            if (remote_revents)
-                ready--;
+            struct ClientContextPollData* poll_data = client->poll_data;
+            struct ClientContextPollData* remote_poll_data =
+                client->remote_poll_data;
 
-            if (UNLIKELY(pollfd->revents & (POLLHUP | POLLERR) &&
-                         client_ctx_on_hup(client) < 0)) {
+            int poll_data_events        = poll_data->events;
+            int remote_poll_data_events = remote_poll_data->events;
+
+            if (poll_data_events & EPOLLIN &&
+                client_ctx_on_recv(client, server.epoll_fd, &auth_ctx) < 0) {
                 if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                    printf("Freeing client: on_hup failed\n");
-                server_free_client(&server, idx);
-                continue;
+                    printf("Freeing client: on_recv failed\n");
+                server_free_client(&server, client_node);
+                goto goto_next;
             }
 
-            if (pollfd->revents & POLLIN) {
-                if (client_ctx_on_recv(client, &server.pollfds, &auth_ctx,
-                                       pollfd, remote_pollfd) < 0) {
-                    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                        printf("Freeing client: on_recv failed\n");
-                    server_free_client(&server, idx);
-                    continue;
-                }
-
-                // NOTE: client_ctx_on_recv may realloc server_ctx->pollfds
-                if (client->state == CLIENT_STATE_WAIT_CONNECT) {
-                    pollfd = vector_get(&server.pollfds, client->pollfd_idx,
-                                        sizeof(struct pollfd));
-
-                    remote_pollfd =
-                        vector_get(&server.pollfds, client->remote_pollfd_idx,
-                                   sizeof(struct pollfd));
-                }
-            }
-
-            if (remote_revents & POLLOUT &&
-                client_ctx_on_remote_send(client, pollfd, remote_pollfd) < 0) {
+            if (remote_poll_data_events & EPOLLOUT &&
+                client_ctx_on_remote_send(client) < 0) {
                 if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                     printf("Freeing client: on_remote_send failed\n");
-                server_free_client(&server, idx);
-                continue;
+                server_free_client(&server, client_node);
+                goto goto_next;
             }
 
-            if (remote_revents & POLLIN &&
-                client_ctx_on_remote_recv(client, pollfd, remote_pollfd) < 0) {
+            if (remote_poll_data_events & EPOLLIN &&
+                client_ctx_on_remote_recv(client) < 0) {
                 if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                     printf("Freeing client: on_remote_recv failed\n");
-                server_free_client(&server, idx);
-                continue;
+                server_free_client(&server, client_node);
+                goto goto_next;
             }
 
-            if (pollfd->revents & POLLOUT &&
-                client_ctx_on_send(client, pollfd, remote_pollfd) < 0) {
+            if (poll_data_events & EPOLLOUT && client_ctx_on_send(client) < 0) {
                 if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
                     printf("Freeing client: on_send failed\n");
-                server_free_client(&server, idx);
-                continue;
+                server_free_client(&server, client_node);
+                goto goto_next;
             }
 
-            if (UNLIKELY(remote_revents & (POLLHUP | POLLERR))) {
-                if (client_ctx_on_remote_hup(client) < 0) {
-                    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                        printf("Freeing client: on_remote_hup failed\n");
-                    server_free_client(&server, idx);
-                } else {
-                    if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
-                        printf("Freeing remote: on_remote_hup succeeded\n");
-                    server_free_client_remote(&server, client);
-                }
+            // Remove from ready list if all events are processed
+            if (!((client->interests & poll_data->events) |
+                  (client->remote_interests &
+                   client->remote_poll_data->events))) {
 
-                continue;
+#if 0
+                 printf("exhausted with interests [ ");
+                if (client->interests & EPOLLIN)
+                    printf("EPOLLIN ");
+                if (client->interests & EPOLLOUT)
+                    printf("EPOLLOUT ");
+                if (client->remote_interests & EPOLLIN)
+                    printf("REMOTE_EPOLLIN ");
+                if (client->remote_interests & EPOLLOUT)
+                    printf("REMOTE_EPOLLOUT ");
+                printf("]\n");
+#endif
+
+                list_remove(&server.ready_clients, client_node);
+                list_append(&server.clients, client_node);
+                server.ready_clients_count--;
+
+                client->ready = false;
             }
 
-            idx++;
+        goto_next:
+            interests_diff |= (poll_data->events ^ client->interests) |
+                (remote_poll_data->events ^ client->remote_interests);
+            client_node = next;
         }
     }
 
