@@ -1066,7 +1066,7 @@ static int server_free_client(struct ServerContext* server,
                client_ctx_state(client), (void*)client);
     }
 
-    if (client->poll_data->events || client->remote_poll_data->events) {
+    if (client->ready) {
         list_remove(&server->ready_clients, client_node);
         server->ready_clients_count--;
     } else {
@@ -1324,9 +1324,10 @@ int main(int argc, char* argv[]) {
                 client->ready = false;
             }
 
-        goto_next:
             interests_diff |= (poll_data->events ^ client->interests) |
                 (remote_poll_data->events ^ client->remote_interests);
+
+        goto_next:
             client_node = next;
         }
     }
