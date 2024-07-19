@@ -265,7 +265,24 @@ static int client_ctx_splice_in(struct ClientContext* client) {
             return -1;
         }
 
-        client->poll_data->events &= ~EPOLLIN;
+        if (client->out_pipe_size < 0xffff) {
+            client->poll_data->events &= ~EPOLLIN;
+        } else {
+            // Pipe may be full, check who caused EAGAIN
+
+            int       error      = 0;
+            socklen_t error_size = sizeof(error);
+            if (getsockopt(client->sock, SOL_SOCKET, SO_ERROR, &error,
+                           &error_size) < 0) {
+                perror("getsockopt");
+                return -1;
+            }
+
+            if (error == EAGAIN) {
+                // It's not a pipe error
+                client->poll_data->events &= ~EPOLLIN;
+            }
+        }
 
         return 0;
     }
@@ -712,7 +729,24 @@ static int client_ctx_splice_remote_in(struct ClientContext* client) {
             return -1;
         }
 
-        client->remote_poll_data->events &= ~EPOLLIN;
+        if (client->in_pipe_size < 0xffff) {
+            client->remote_poll_data->events &= ~EPOLLIN;
+        } else {
+            // Pipe may be full, check who caused EAGAIN
+
+            int       error      = 0;
+            socklen_t error_size = sizeof(error);
+            if (getsockopt(client->remote_sock, SOL_SOCKET, SO_ERROR, &error,
+                           &error_size) < 0) {
+                perror("getsockopt");
+                return -1;
+            }
+
+            if (error == EAGAIN) {
+                // It's not a pipe error
+                client->remote_poll_data->events &= ~EPOLLIN;
+            }
+        }
 
         return 0;
     }
