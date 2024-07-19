@@ -281,6 +281,9 @@ static int client_ctx_splice_in(struct ClientContext* client) {
             if (error == EAGAIN) {
                 // It's not a pipe error
                 client->poll_data->events &= ~EPOLLIN;
+            } else {
+                // Wait for pipe to be freed
+                client->interests &= ~EPOLLIN;
             }
         }
 
@@ -295,7 +298,7 @@ static int client_ctx_splice_in(struct ClientContext* client) {
     return 0;
 }
 
-static int client_ctx_splice_out(struct ClientContext* client) {
+static ssize_t client_ctx_splice_out(struct ClientContext* client) {
     ssize_t sent =
         splice(client->out_pipe[0], NULL, client->remote_sock, NULL,
                client->out_pipe_size, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
@@ -315,7 +318,7 @@ static int client_ctx_splice_out(struct ClientContext* client) {
 
     client->out_pipe_size -= sent;
 
-    return 0;
+    return sent;
 }
 
 static int client_ctx_on_recv(struct ClientContext* client, int epoll_fd,
@@ -759,7 +762,7 @@ static int client_ctx_splice_remote_in(struct ClientContext* client) {
     return 0;
 }
 
-static int client_ctx_splice_remote_out(struct ClientContext* client) {
+static ssize_t client_ctx_splice_remote_out(struct ClientContext* client) {
     ssize_t sent =
         splice(client->in_pipe[0], NULL, client->sock, NULL,
                client->in_pipe_size, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
@@ -779,7 +782,7 @@ static int client_ctx_splice_remote_out(struct ClientContext* client) {
 
     client->in_pipe_size -= sent;
 
-    return 0;
+    return sent;
 }
 
 static int client_ctx_on_remote_recv(struct ClientContext* client) {
@@ -793,26 +796,28 @@ static int client_ctx_on_remote_recv(struct ClientContext* client) {
 }
 
 static int client_ctx_on_send(struct ClientContext* client) {
-    if (client->in_pipe_size > 0 && client_ctx_splice_remote_out(client) < 0)
-        return -1;
+    if (client->in_pipe_size > 0) {
+        ssize_t sent = client_ctx_splice_remote_out(client);
 
-    size_t buffer_size = client->in_pipe_size;
+        if (sent > 0)
+            client->interests |= EPOLLOUT;
 
-    if (buffer_size == 0) {
-        // Wait for everything to be sent, then disconnect
-        if (client->state == CLIENT_STATE_DISCONNECTING) {
-            char address[64];
-            client_ctx_get_address(client, address, sizeof(address));
+        if (client->in_pipe_size == 0) {
+            // Wait for everything to be sent, then disconnect
+            if (client->state == CLIENT_STATE_DISCONNECTING) {
+                char address[64];
+                client_ctx_get_address(client, address, sizeof(address));
 
-            if (LOG_LEVEL >= LOG_LEVEL_INFO)
-                printf("%-21s [%-13s]: Disconnecting\n", address,
-                       client_ctx_state(client));
+                if (LOG_LEVEL >= LOG_LEVEL_INFO)
+                    printf("%-21s [%-13s]: Disconnecting\n", address,
+                           client_ctx_state(client));
 
-            return -1;
+                return -1;
+            }
+
+            // There is nothing to send to the client
+            client->interests &= ~EPOLLOUT;
         }
-
-        // There is nothing to send to the client
-        client->interests &= ~EPOLLOUT;
     }
 
     return 0;
@@ -820,11 +825,15 @@ static int client_ctx_on_send(struct ClientContext* client) {
 
 static int client_ctx_on_remote_send(struct ClientContext* client) {
     if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
-        if (client->out_pipe_size > 0 && client_ctx_splice_out(client) < 0)
-            return -1;
+        if (client->out_pipe_size > 0) {
+            ssize_t sent = client_ctx_splice_out(client);
 
-        if (client->out_pipe_size == 0)
-            client->remote_interests &= ~EPOLLOUT;
+            if (sent > 0)
+                client->interests |= EPOLLIN;
+
+            if (client->out_pipe_size == 0)
+                client->remote_interests &= ~EPOLLOUT;
+        }
 
         return 0;
     }
@@ -1296,7 +1305,7 @@ int main(int argc, char* argv[]) {
                    client->remote_poll_data->events))) {
 
 #if 0
-                 printf("exhausted with interests [ ");
+                printf("exhausted with interests [ ");
                 if (client->interests & EPOLLIN)
                     printf("EPOLLIN ");
                 if (client->interests & EPOLLOUT)
