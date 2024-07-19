@@ -181,6 +181,18 @@ static int client_ctx_on_remote_hup(struct ClientContext* client) {
         return 0;
     }
 
+#ifdef NS_SPLICE
+    size_t buffer_size = client->in_pipe_size;
+#else
+    size_t buffer_size = ring_buffer_size(&client->in_queue);
+#endif
+
+    // Still need to send the rest of the data
+    if (buffer_size > 0) {
+        client->state = CLIENT_STATE_DISCONNECTING;
+        return 0;
+    }
+
     return -1;
 }
 
@@ -234,9 +246,9 @@ static void client_ctx_free(struct ClientContext* client) {
 
 #ifdef NS_SPLICE
 static int client_ctx_splice_in(struct ClientContext* client) {
-    ssize_t read = splice(client->sock, NULL, client->out_pipe[1], NULL,
-                          CLIENT_BUFFER_SIZE,
-                          SPLICE_F_MORE | SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    ssize_t read =
+        splice(client->sock, NULL, client->out_pipe[1], NULL,
+               CLIENT_BUFFER_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (read < 0) {
         if (errno != EAGAIN) {
             char address[64];
@@ -258,9 +270,9 @@ static int client_ctx_splice_in(struct ClientContext* client) {
 }
 
 static int client_ctx_splice_out(struct ClientContext* client) {
-    ssize_t sent = splice(client->out_pipe[0], NULL, client->remote_sock, NULL,
-                          CLIENT_BUFFER_SIZE,
-                          SPLICE_F_MORE | SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    ssize_t sent =
+        splice(client->out_pipe[0], NULL, client->remote_sock, NULL,
+               CLIENT_BUFFER_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (sent < 0) {
         if (errno != EAGAIN) {
             char address[64];
@@ -278,21 +290,6 @@ static int client_ctx_splice_out(struct ClientContext* client) {
     return 0;
 }
 
-static int client_ctx_splice(struct ClientContext* client,
-                             struct pollfd*        remote_pollfd) {
-    if (client_ctx_splice_in(client) < 0)
-        return -1;
-
-    if (client_ctx_splice_out(client) < 0)
-        return -1;
-
-    /* If we failed to send out_pipe to the remote,
-     * then do it when send will be available */
-    if (client->out_pipe_size > 0)
-        remote_pollfd->events |= POLLOUT;
-
-    return 0;
-}
 #endif
 
 static int client_ctx_on_recv(struct ClientContext*         client,
@@ -301,16 +298,16 @@ static int client_ctx_on_recv(struct ClientContext*         client,
                               struct pollfd*                pollfd,
                               struct pollfd*                remote_pollfd) {
 #ifdef NS_SPLICE
-    if (LIKELY(client->state == CLIENT_STATE_STREAMING))
-        return client_ctx_splice(client, remote_pollfd);
-#endif
+    if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
+        if (client_ctx_splice_in(client) < 0)
+            return -1;
 
-    // Wait for remote connection first
-    if (UNLIKELY(client->state == CLIENT_STATE_WAIT_CONNECT)) {
-        // Stop accepting data until connection is made
-        pollfd->events &= ~POLLIN;
+        if (client->out_pipe_size > 0)
+            remote_pollfd->events |= POLLOUT;
+
         return 0;
     }
+#endif
 
     char buffer[CLIENT_BUFFER_SIZE];
 #ifndef NS_SPLICE
@@ -718,19 +715,22 @@ static int client_ctx_on_recv(struct ClientContext*         client,
             return -1;
         }
 
-        struct pollfd pollfd;
-        pollfd.fd = remote_sock;
+        struct pollfd remote_pollfd;
+        remote_pollfd.fd = remote_sock;
 
         // POLLOUT should be on until connection is made
-        pollfd.events  = POLLIN | POLLOUT;
-        pollfd.revents = 0;
+        remote_pollfd.events  = POLLIN | POLLOUT;
+        remote_pollfd.revents = 0;
 
         client->remote_sock       = remote_sock;
         client->remote_pollfd_idx = pollfds->length;
-        if (vector_push(pollfds, &pollfd, sizeof(pollfd)) < 0) {
+        if (vector_push(pollfds, &remote_pollfd, sizeof(remote_pollfd)) < 0) {
             perror("Remote socket pollfd allocation failed");
             return -1;
         }
+
+        // Wait for remote connection first
+        pollfd->events &= ~POLLIN;
 
         client->state = CLIENT_STATE_WAIT_CONNECT;
     }
@@ -740,9 +740,9 @@ static int client_ctx_on_recv(struct ClientContext*         client,
 
 #ifdef NS_SPLICE
 static int client_ctx_splice_remote_in(struct ClientContext* client) {
-    ssize_t read = splice(client->remote_sock, NULL, client->in_pipe[1], NULL,
-                          CLIENT_BUFFER_SIZE,
-                          SPLICE_F_MORE | SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    ssize_t read =
+        splice(client->remote_sock, NULL, client->in_pipe[1], NULL,
+               CLIENT_BUFFER_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (read < 0) {
         if (errno != EAGAIN) {
             char address[64];
@@ -764,9 +764,9 @@ static int client_ctx_splice_remote_in(struct ClientContext* client) {
 }
 
 static int client_ctx_splice_remote_out(struct ClientContext* client) {
-    ssize_t sent = splice(client->in_pipe[0], NULL, client->sock, NULL,
-                          client->in_pipe_size,
-                          SPLICE_F_MORE | SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    ssize_t sent =
+        splice(client->in_pipe[0], NULL, client->sock, NULL,
+               client->in_pipe_size, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (sent < 0) {
         if (errno != EAGAIN) {
             char address[64];
@@ -783,30 +783,21 @@ static int client_ctx_splice_remote_out(struct ClientContext* client) {
 
     return 0;
 }
-
-static int client_ctx_splice_remote(struct ClientContext* client,
-                                    struct pollfd*        pollfd) {
-    if (client_ctx_splice_remote_in(client) < 0)
-        return -1;
-
-    if (client_ctx_splice_remote_out(client) < 0)
-        return -1;
-
-    /* If we failed to send in_pipe to the client,
-     * then do it when send will be available */
-    if (client->in_pipe_size > 0) {
-        pollfd->events |= POLLOUT;
-    }
-
-    return 0;
-}
 #endif
 
 static int client_ctx_on_remote_recv(struct ClientContext* client,
                                      struct pollfd*        pollfd,
                                      struct pollfd*        remote_pollfd) {
 #ifdef NS_SPLICE
-    return client_ctx_splice_remote(client, pollfd);
+    (void)remote_pollfd;
+
+    if (client_ctx_splice_remote_in(client) < 0)
+        return -1;
+
+    if (client->in_pipe_size > 0)
+        pollfd->events |= POLLOUT;
+
+    return 0;
 #else
     size_t buffer_avail_size =
         client->in_queue.capacity - ring_buffer_size(&client->in_queue);
@@ -880,21 +871,12 @@ static int client_ctx_on_send(struct ClientContext* client,
                               struct pollfd*        pollfd,
                               struct pollfd*        remote_pollfd) {
 #ifdef NS_SPLICE
-    if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
-        if (client_ctx_splice_remote_out(client) < 0)
-            return -1;
-
-        pollfd->events &= ~POLLOUT;
-        return 0;
-    }
-#endif
-
-    char buffer[CLIENT_BUFFER_SIZE];
-#ifdef NS_SPLICE
     size_t buffer_size = client->in_pipe_size;
 #else
+    char   buffer[CLIENT_BUFFER_SIZE];
     size_t buffer_size = ring_buffer_size(&client->in_queue);
 #endif
+    // TODO: Is this needed with splice
     if (UNLIKELY(buffer_size == 0)) {
         // Wait for everything to be sent, then disconnect
         if (client->state == CLIENT_STATE_DISCONNECTING) {
@@ -913,14 +895,12 @@ static int client_ctx_on_send(struct ClientContext* client,
         return 0;
     }
 
-    size_t  to_send = MIN(buffer_size, sizeof(buffer));
-
-    ssize_t sent;
 #ifdef NS_SPLICE
-    sent =
-        splice(client->in_pipe[0], NULL, client->sock, NULL, CLIENT_BUFFER_SIZE,
-               SPLICE_F_MORE | SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
+    if (client_ctx_splice_remote_out(client) < 0)
+        return -1;
 #else
+    ssize_t sent    = 0;
+    size_t  to_send = MIN(buffer_size, sizeof(buffer));
     if (ring_buffer_is_trivially_copyable(&client->in_queue, buffer_size)) {
         // Send directly from the ring buffer
         sent =
@@ -934,6 +914,7 @@ static int client_ctx_on_send(struct ClientContext* client,
     }
 #endif
 
+#ifndef NS_SPLICE
     if (sent < 0) {
         if (errno != EAGAIN) {
             char address[64];
@@ -953,22 +934,21 @@ static int client_ctx_on_send(struct ClientContext* client,
         printf("%-21s [%-13s]: SEND >> %zu | sent=%zd\n", address,
                client_ctx_state(client), to_send, sent);
     }
+#endif
 
     // We sent all data in the buffer
 #ifdef NS_SPLICE
-    client->in_pipe_size -= sent;
     if (client->in_pipe_size == 0)
         pollfd->events &= ~POLLOUT;
 #else
     ring_buffer_shrink(&client->in_queue, sent);
-#endif
-
     if ((size_t)sent == buffer_size)
         pollfd->events &= ~POLLOUT;
 
     // We freed some space in the buffer
     if (remote_pollfd != NULL)
         remote_pollfd->events |= POLLIN;
+#endif
 
     return 0;
 }
@@ -978,10 +958,11 @@ static int client_ctx_on_remote_send(struct ClientContext* client,
                                      struct pollfd*        remote_pollfd) {
 #ifdef NS_SPLICE
     if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
-        if (client_ctx_splice_remote_out(client) < 0)
+        if (client_ctx_splice_out(client) < 0)
             return -1;
 
-        remote_pollfd->events &= ~POLLOUT;
+        if (client->out_pipe_size == 0)
+            remote_pollfd->events &= ~POLLOUT;
 
         return 0;
     }
@@ -1003,6 +984,13 @@ static int client_ctx_on_remote_send(struct ClientContext* client,
 #else
         pollfd->events = POLLIN | POLLOUT;
 #endif
+
+        // Enable nagle algorithm back
+        if (setsockopt(client->sock, IPPROTO_TCP, TCP_NODELAY, &(int){0},
+                       sizeof(int)) < 0) {
+            perror("setsockopt TCP_NODELAY");
+            return -1;
+        }
 
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
             char address[64];
@@ -1160,9 +1148,8 @@ static int server_ctx_accept(struct ServerContext* server) {
     }
 
     // Disable nagle algorithm
-    int value = 1;
-    if (setsockopt(client_sock, IPPROTO_TCP, TCP_NODELAY, &value,
-                   sizeof(value)) < 0) {
+    if (setsockopt(client->sock, IPPROTO_TCP, TCP_NODELAY, &(int){1},
+                   sizeof(int)) < 0) {
         perror("setsockopt TCP_NODELAY");
         return -1;
     }
