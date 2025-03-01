@@ -1297,16 +1297,14 @@ int main(int argc, char* argv[]) {
     if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("Starting on port %hu\n", server_port);
 
-    int interests_diff = 1;
     while (true) {
         struct epoll_event events[256];
 
         int                ready = 0;
-        if (interests_diff || server.ready_clients_count == 0) {
-            int timeout    = server.ready_clients_count > 0 ? 0 : -1;
-            ready          = epoll_wait(server.epoll_fd, events,
-                                        sizeof(events) / sizeof(*events), timeout);
-            interests_diff = 0;
+        {
+            int timeout = server.ready_clients_count > 0 ? 0 : -1;
+            ready       = epoll_wait(server.epoll_fd, events,
+                                     sizeof(events) / sizeof(*events), timeout);
         }
 
         if (UNLIKELY(ready < 0)) {
@@ -1370,9 +1368,6 @@ int main(int argc, char* argv[]) {
         if (server.events & EPOLLIN) {
             if (server_ctx_accept(&server) < 0)
                 break;
-
-            if (!server.events)
-                interests_diff = 1;
         }
 
         struct ListNode* client_node = server.ready_clients.head;
@@ -1441,9 +1436,6 @@ int main(int argc, char* argv[]) {
 
                 client->ready = false;
             }
-
-            interests_diff |= (poll_data->events ^ client->interests) |
-                (remote_poll_data->events ^ client->remote_interests);
 
         goto_next:
             client_node = next;
