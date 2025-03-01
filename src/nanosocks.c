@@ -73,13 +73,20 @@ struct ClientContextPollData {
     int                   events;
 };
 
-static void client_ctx_init(struct ClientContext* client) {
+static int client_ctx_init(struct ClientContext* client) {
     client->state = CLIENT_STATE_WAIT_GREET;
 
     client->remote_sock = INVALID_SOCKFD;
 
-    pipe((int*)&client->in_pipe);
-    pipe((int*)&client->out_pipe);
+    if (pipe((int*)&client->in_pipe) < 0) {
+        perror("In pipe creation failed");
+        return -1;
+    }
+
+    if (pipe((int*)&client->out_pipe) < 0) {
+        perror("Out pipe creation failed");
+        return -1;
+    }
 
     client->in_pipe_size = client->out_pipe_size = 0;
 
@@ -90,6 +97,8 @@ static void client_ctx_init(struct ClientContext* client) {
     client->remote_interests = 0;
 
     client->ready = false;
+
+    return 0;
 }
 
 static const char* client_ctx_state(struct ClientContext* client) {
@@ -983,7 +992,6 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
 }
 
 static int server_ctx_accept(struct ServerContext* server) {
-
     // Accept socket
     struct sockaddr_in sin;
     socklen_t          sin_length = sizeof(sin);
@@ -1009,7 +1017,11 @@ static int server_ctx_accept(struct ServerContext* server) {
     }
 
     struct ClientContext* client = list_node_data(client_node);
-    client_ctx_init(client);
+    if (client_ctx_init(client) < 0) {
+        perror("Client initialization failed");
+        list_remove(&server->clients, client_node);
+        return -1;
+    }
 
     client->sock = client_sock;
     memcpy(&client->sin, &sin, sizeof(sin));
