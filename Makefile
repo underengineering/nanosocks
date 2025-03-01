@@ -1,9 +1,11 @@
 CC = gcc
 
+CFLAGS ?= -O3
+
 .PHONY: all
 all: src/nanosocks.c src/nanosocks.h
 	mkdir -p build
-	$(CC) -O3 -std=c99 src/nanosocks.c -o build/nanosocks
+	$(CC) $(CFLAGS) -std=c99 src/nanosocks.c -o build/nanosocks
 
 .PHONY: clean
 clean: build
