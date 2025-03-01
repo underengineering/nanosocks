@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/fcntl.h>
+#include <sys/signalfd.h>
 #include <unistd.h>
 
 #include "nanosocks.h"
@@ -1005,6 +1006,27 @@ failure_socket:
     return -1;
 }
 
+static int server_ctx_setup_signal_handler(const struct ServerContext* server,
+                                           sigset_t                    mask) {
+    int sfd = signalfd(-1, &mask, 0);
+    if (sfd == -1) {
+        perror("signalfd");
+        return -1;
+    }
+
+    struct epoll_event event;
+    event.events   = EPOLLIN | EPOLLET;
+    event.data.ptr = NULL;
+
+    if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, sfd, &event) < 0) {
+        perror("epoll_ctl failed");
+        close(sfd);
+        return 1;
+    }
+
+    return 0;
+}
+
 static int server_ctx_accept(struct ServerContext* server) {
     // Accept socket
     struct sockaddr_in sin;
@@ -1204,13 +1226,6 @@ static void server_ctx_free(struct ServerContext* server) {
     close(server->server_sock);
 }
 
-static volatile bool g_should_stop = false;
-static void          on_sigint(int sig) {
-    fprintf(stderr, "Caught SIGINT\n");
-    signal(sig, SIG_IGN);
-    g_should_stop = true;
-}
-
 int main(int argc, char* argv[]) {
     if (argc <= 1) {
         fprintf(stderr, "Usage: %s [OPTIONS]\n", argv[0]);
@@ -1258,23 +1273,37 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    signal(SIGPIPE, SIG_IGN);
-    signal(SIGINT, on_sigint);
-
     struct ServerContext server;
     if (server_ctx_init(&server, server_port) < 0)
         return 1;
+
+    // Setup signal handlers
+    signal(SIGPIPE, SIG_IGN);
+    {
+        sigset_t mask;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGINT);
+        sigaddset(&mask, SIGQUIT);
+
+        if (sigprocmask(SIG_BLOCK, &mask, NULL) == -1) {
+            perror("sigprocmask");
+            return 1;
+        }
+
+        if (server_ctx_setup_signal_handler(&server, mask) < 0)
+            return 1;
+    }
 
     if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("Starting on port %hu\n", server_port);
 
     int interests_diff = 1;
-    while (!g_should_stop) {
+    while (true) {
         struct epoll_event events[256];
 
         int                ready = 0;
         if (interests_diff || server.ready_clients_count == 0) {
-            int timeout    = server.ready_clients_count > 0 ? 0 : 1000;
+            int timeout    = server.ready_clients_count > 0 ? 0 : -1;
             ready          = epoll_wait(server.epoll_fd, events,
                                         sizeof(events) / sizeof(*events), timeout);
             interests_diff = 0;
@@ -1285,11 +1314,15 @@ int main(int argc, char* argv[]) {
             break;
         }
 
+        bool should_stop = false;
         for (size_t idx = 0; idx < (size_t)ready; idx++) {
             const struct epoll_event* const event = &events[idx];
             if (UNLIKELY(event->data.ptr == &server)) {
                 server.events = event->events;
                 continue;
+            } else if (UNLIKELY(event->data.ptr == NULL)) {
+                should_stop = true;
+                break;
             }
 
             struct ClientContextPollData* const poll_data = event->data.ptr;
@@ -1330,6 +1363,9 @@ int main(int argc, char* argv[]) {
 
             poll_data->events = event->events;
         }
+
+        if (should_stop)
+            break;
 
         if (server.events & EPOLLIN) {
             if (server_ctx_accept(&server) < 0)
