@@ -963,7 +963,7 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
             goto failure_socket;
         }
 
-        if (listen(server_sock, 1) < 0) {
+        if (listen(server_sock, 4096) < 0) {
             perror("Listen failed");
             goto failure_socket;
         }
