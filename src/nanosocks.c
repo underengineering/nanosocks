@@ -1293,7 +1293,7 @@ int main(int argc, char* argv[]) {
             int interests = poll_data == remote_poll_data ?
                 client->remote_interests :
                 client->interests;
-            if (!client->ready && (events->events & interests)) {
+            if (!client->ready && (event->events & interests)) {
                 // Move to ready list
 
                 struct ListNode* client_node = list_node_from_data(client);
