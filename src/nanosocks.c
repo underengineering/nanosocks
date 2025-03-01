@@ -1204,16 +1204,10 @@ int main(int argc, char* argv[]) {
                 server_port = strtoul(optarg, NULL, 10);
                 break;
             case 'u':
-                auth_ctx.username    = malloc(strlen(optarg) + 1);
-                auth_ctx.username[0] = '\0';
-
-                strcpy(auth_ctx.username, optarg);
+                auth_ctx.username = strdup(optarg);
                 break;
             case 'p':
-                auth_ctx.password    = malloc(strlen(optarg) + 1);
-                auth_ctx.password[0] = '\0';
-
-                strcpy(auth_ctx.password, optarg);
+                auth_ctx.password = strdup(optarg);
                 break;
             default:
                 return 1;
