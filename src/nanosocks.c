@@ -943,14 +943,14 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
         socket(AF_INET, SOCK_STREAM | O_NONBLOCK, 0);
     if (server_sock < 0) {
         perror("Failed to create server socket");
-        return -1;
+        goto failure_socket;
     }
 
     int value = 1;
     if (setsockopt(server_sock, SOL_SOCKET, SO_REUSEADDR, &value,
                    sizeof(value)) < 0) {
         perror("setsockopt failed");
-        return -1;
+        goto failure_socket;
     }
 
     {
@@ -960,12 +960,12 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
         sin.sin_port        = htons(port);
         if (bind(server_sock, (const struct sockaddr*)&sin, sizeof(sin)) < 0) {
             perror("Bind failed");
-            return -1;
+            goto failure_socket;
         }
 
         if (listen(server_sock, 1) < 0) {
             perror("Listen failed");
-            return -1;
+            goto failure_socket;
         }
     }
 
@@ -976,19 +976,28 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
     list_init(&server->poll_data_list);
     server->ready_clients_count = 0;
 
-    server->epoll_fd = epoll_create1(0);
+    int epoll_fd = server->epoll_fd = epoll_create1(0);
+    if (epoll_fd < 0) {
+        perror("epoll_create1 failed");
+        goto failure_socket;
+    }
 
     // Add server pollfd
     struct epoll_event event;
     event.events   = EPOLLIN | EPOLLET;
     event.data.ptr = server;
 
-    if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, server_sock, &event) < 0) {
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, server_sock, &event) < 0) {
         perror("epoll_ctl failed");
-        return -1;
+        goto failure_epoll;
     }
 
     return 0;
+failure_epoll:
+    close(epoll_fd);
+failure_socket:
+    close(server_sock);
+    return -1;
 }
 
 static int server_ctx_accept(struct ServerContext* server) {
@@ -1000,7 +1009,7 @@ static int server_ctx_accept(struct ServerContext* server) {
     if (client_sock < 0) {
         if (errno != EAGAIN) {
             perror("Accept failed");
-            return -1;
+            goto failure_accept;
         }
 
         server->events = 0;
@@ -1013,14 +1022,14 @@ static int server_ctx_accept(struct ServerContext* server) {
         list_alloc(&server->clients, sizeof(struct ClientContext));
     if (client_node == NULL) {
         perror("Failed to allocate a ClientContext node");
-        return -1;
+        goto failure_accept;
     }
 
+    list_append(&server->clients, client_node);
     struct ClientContext* client = list_node_data(client_node);
     if (client_ctx_init(client) < 0) {
         perror("Client initialization failed");
-        list_remove(&server->clients, client_node);
-        return -1;
+        goto failure_client_alloc;
     }
 
     client->sock = client_sock;
@@ -1030,22 +1039,19 @@ static int server_ctx_accept(struct ServerContext* server) {
     int flags = fcntl(client_sock, F_GETFL);
     if (flags < 0) {
         perror("F_GETFL failed");
-        close(client_sock);
-        return -1;
+        goto failure_client_alloc;
     }
 
     if (fcntl(client_sock, F_SETFL, flags | O_NONBLOCK) < 0) {
         perror("F_SETFL O_NONBLOCK failed");
-        close(client_sock);
-        return -1;
+        goto failure_client_alloc;
     }
 
     // Disable nagle algorithm
     if (setsockopt(client->sock, IPPROTO_TCP, TCP_NODELAY, &(int){1},
                    sizeof(int)) < 0) {
         perror("setsockopt TCP_NODELAY");
-        close(client_sock);
-        return -1;
+        goto failure_client_alloc;
     }
 
     if (LOG_LEVEL >= LOG_LEVEL_INFO) {
@@ -1057,23 +1063,23 @@ static int server_ctx_accept(struct ServerContext* server) {
     }
 
     // Preallocate remote epoll data
-    {
-        struct ListNode* epoll_data_node = list_alloc(
-            &server->poll_data_list, sizeof(struct ClientContextPollData));
-        if (epoll_data_node == NULL) {
-            perror("Failed to allocate a ClientContextPollData node");
-            close(client_sock);
-            return -1;
-        }
+    struct ListNode* remote_epoll_data_node = list_alloc(
+        &server->poll_data_list, sizeof(struct ClientContextPollData));
+    if (remote_epoll_data_node == NULL) {
+        perror("Failed to allocate a ClientContextPollData node");
+        close(client_sock);
+        goto failure_client_alloc;
+    }
 
+    {
         struct ClientContextPollData* poll_data =
-            list_node_data(epoll_data_node);
+            list_node_data(remote_epoll_data_node);
         poll_data->client = client;
         poll_data->events = 0;
 
-        list_append(&server->poll_data_list, epoll_data_node);
-
         client->remote_poll_data = poll_data;
+
+        list_append(&server->poll_data_list, remote_epoll_data_node);
     }
 
     // Allocate epoll data
@@ -1082,31 +1088,48 @@ static int server_ctx_accept(struct ServerContext* server) {
     if (epoll_data_node == NULL) {
         perror("Failed to allocate a ClientContextPollData node");
         close(client_sock);
-        return -1;
+        goto failure_remote_epoll_data;
     }
 
-    struct ClientContextPollData* poll_data = list_node_data(epoll_data_node);
-    poll_data->client                       = client;
-    poll_data->events                       = 0;
+    {
+        struct ClientContextPollData* poll_data =
+            list_node_data(epoll_data_node);
+        poll_data->client = client;
+        poll_data->events = 0;
 
-    list_append(&server->poll_data_list, epoll_data_node);
+        client->poll_data = poll_data;
 
-    client->poll_data = poll_data;
+        list_append(&server->poll_data_list, epoll_data_node);
 
-    // Add to epoll fd
-    struct epoll_event event;
-    event.events   = EPOLLIN | EPOLLOUT | EPOLLET;
-    event.data.ptr = poll_data;
+        // Add to epoll fd
+        struct epoll_event event;
+        event.events   = EPOLLIN | EPOLLOUT | EPOLLET;
+        event.data.ptr = poll_data;
 
-    if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, client_sock, &event) < 0) {
-        perror("epoll_ctl failed");
-        return -1;
+        if (epoll_ctl(server->epoll_fd, EPOLL_CTL_ADD, client_sock, &event) <
+            0) {
+            perror("epoll_ctl failed");
+            goto failure_epoll_data;
+        }
     }
 
     // Wait for command
     client->interests |= EPOLLIN;
 
     return 0;
+
+failure_epoll_data:
+    list_remove(&server->clients, epoll_data_node);
+    free(epoll_data_node);
+failure_remote_epoll_data:
+    list_remove(&server->clients, remote_epoll_data_node);
+    free(remote_epoll_data_node);
+failure_client_alloc:
+    list_remove(&server->clients, client_node);
+    free(client_node);
+failure_accept:
+    close(client_sock);
+    return -1;
 }
 
 static int server_free_client(struct ServerContext* server,
