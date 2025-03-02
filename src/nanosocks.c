@@ -530,7 +530,7 @@ static int client_ctx_auth(struct ClientContext*         client,
     const uint8_t response[2] = {0x01, 0x00};
     client_ctx_write_in_queue(client, response, sizeof(response));
 
-    client->interests = EPOLLOUT;
+    client->interests = EPOLLIN | EPOLLOUT;
     client->state     = CLIENT_STATE_WAIT_REQUEST;
 
     return 0;
