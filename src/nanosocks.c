@@ -639,9 +639,8 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
                    client_ctx_state(client), domain);
 
         // Resolve ipv4
-        struct addrinfo* const addr_info = NULL;
-        if (getaddrinfo(domain, NULL, NULL, (struct addrinfo**)&addr_info) <
-            0) {
+        struct addrinfo* addr_info = NULL;
+        if (getaddrinfo(domain, NULL, NULL, &addr_info) < 0) {
             char response[4 + 4 + 2];
             response[0]              = 0x05;                          //ver
             response[1]              = SOCKS5_STATUS_GENERAL_FAILURE; //status
@@ -683,7 +682,7 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
             client->interests = EPOLLOUT;
             client->state     = CLIENT_STATE_DISCONNECTING;
 
-            if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
+            if (LOG_LEVEL >= LOG_LEVEL_INFO)
                 printf("%-21s [%-13s]: Failed to resolve %s\n", address,
                        client_ctx_state(client), domain);
 
