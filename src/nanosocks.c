@@ -1267,9 +1267,13 @@ int main(int argc, char* argv[]) {
                 server_port = strtoul(optarg, NULL, 10);
                 break;
             case 'u':
+                if (auth_ctx.username)
+                    free(auth_ctx.username);
                 auth_ctx.username = strdup(optarg);
                 break;
             case 'p':
+                if (auth_ctx.password)
+                    free(auth_ctx.password);
                 auth_ctx.password = strdup(optarg);
                 break;
             default:
