@@ -711,7 +711,7 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
 
         client->remote_sin.sin_family      = AF_INET;
         client->remote_sin.sin_addr.s_addr = remote_address;
-        client->remote_sin.sin_port        = htons(remote_port);
+        client->remote_sin.sin_port        = remote_port;
     } else if (address_type == SOCKS5_ADDR_DOMAIN) {
         required_size += 1 + 2;
         if (read < required_size) {
