@@ -590,12 +590,12 @@ static void client_ctx_ares_callback(void* arg, int status, int timeouts,
     if (info == NULL) {
         // No available address found
         char response[4 + 4 + 2];
-        response[0]                  = 0x05;                          //ver
-        response[1]                  = SOCKS5_STATUS_GENERAL_FAILURE; //status
-        response[2]                  = 0x00;                          //rsv
-        response[3]                  = 0x01;                          //ipv4
-        *(uint32_t*)&response[4]     = 0;                             //addr
-        *(uint16_t*)&response[4 + 4] = 0;                             //port
+        response[0] = 0x05;                            //ver
+        response[1] = SOCKS5_STATUS_GENERAL_FAILURE;   //status
+        response[2] = 0x00;                            //rsv
+        response[3] = 0x01;                            //ipv4
+        memset(&response[4], 0, sizeof(uint32_t));     //addr
+        memset(&response[4 + 4], 0, sizeof(uint16_t)); //port
         client_ctx_write_in_queue(client, response, sizeof(response));
 
         client->interests = EPOLLOUT;
@@ -661,12 +661,12 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
     const uint8_t address_type = req->address_type;
     if (address_type == SOCKS5_ADDR_IPV6) {
         char response[4 + 4 + 2];
-        response[0]              = 0x05;                                //ver
-        response[1]              = SOCKS5_STATUS_ADDRESS_NOT_SUPPORTED; //status
-        response[2]              = 0x00;                                //rsv
-        response[3]              = 0x01;                                //ipv4
-        *(uint32_t*)&response[4] = 0;                                   //addr
-        *(uint16_t*)&response[4 + 4] = 0;                               //port
+        response[0] = 0x05;                                //ver
+        response[1] = SOCKS5_STATUS_ADDRESS_NOT_SUPPORTED; //status
+        response[2] = 0x00;                                //rsv
+        response[3] = 0x01;                                //ipv4
+        memset(&response[4], 0, sizeof(uint32_t));         //addr
+        memset(&response[4 + 4], 0, sizeof(uint16_t));     //port
         client_ctx_write_in_queue(client, response, sizeof(response));
 
         client->interests = EPOLLOUT;
@@ -691,10 +691,10 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
             return -1;
         }
 
-        remote_address = *(uint32_t*)&buffer[offset];
+        memcpy(&remote_address, &buffer[offset], sizeof(remote_address));
         offset += 4;
 
-        remote_port = *(uint16_t*)&buffer[offset];
+        memcpy(&remote_port, &buffer[offset], sizeof(remote_port));
 
         client->remote_sin.sin_family      = AF_INET;
         client->remote_sin.sin_addr.s_addr = remote_address;
@@ -722,7 +722,7 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
         domain[domain_size] = '\0';
         offset += domain_size;
 
-        remote_port = *(const uint16_t*)&buffer[offset];
+        memcpy(&remote_port, &buffer[offset], sizeof(remote_port));
         if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
             printf("%-21s [%-13s]: Resolving domain %s\n", address,
                    client_ctx_state(client), domain);
@@ -894,12 +894,15 @@ static int client_ctx_on_remote_send(struct ClientContext* client) {
 
     if (UNLIKELY(client->state == CLIENT_STATE_WAIT_CONNECT)) {
         char response[4 + 4 + 2];
-        response[0]              = 0x05;                               //ver
-        response[1]              = SOCKS5_STATUS_REQUEST_GRANTED;      //status
-        response[2]              = 0x00;                               //rsv
-        response[3]              = 0x01;                               //ipv4
-        *(uint32_t*)&response[4] = client->remote_sin.sin_addr.s_addr; //addr
-        *(uint16_t*)&response[4 + 4] = client->remote_sin.sin_port;    //port
+        response[0] = 0x05;                          //ver
+        response[1] = SOCKS5_STATUS_REQUEST_GRANTED; //status
+        response[2] = 0x00;                          //rsv
+        response[3] = 0x01;                          //ipv4
+        memcpy(&response[4], &client->remote_sin.sin_addr.s_addr,
+               sizeof(uint32_t)); //addr
+        memcpy(&response[4 + 4], &client->remote_sin.sin_port,
+               sizeof(uint16_t)); //port
+
         client_ctx_write_in_queue(client, response, sizeof(response));
 
         // Enable nagle algorithm back
