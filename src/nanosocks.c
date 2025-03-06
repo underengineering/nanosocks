@@ -23,7 +23,7 @@
 #include "protocol.h"
 #include "util.h"
 
-static const size_t CLIENT_BUFFER_SIZE = 0xffff;
+static const size_t CLIENT_BUFFER_SIZE = 1 << 20;
 
 enum LogLevel {
     LOG_LEVEL_ERROR   = 0,
@@ -104,15 +104,19 @@ static int client_ctx_init(struct ClientContext* client, int sock,
     client->sock        = sock;
     client->remote_sock = INVALID_SOCKFD;
 
-    if (pipe((int*)&client->in_pipe) < 0) {
+    if (pipe2((int*)&client->in_pipe, O_NONBLOCK) < 0) {
         perror("In pipe creation failed");
         return -1;
     }
 
-    if (pipe((int*)&client->out_pipe) < 0) {
+    fcntl(client->in_pipe.out, F_SETPIPE_SZ, CLIENT_BUFFER_SIZE);
+
+    if (pipe2((int*)&client->out_pipe, O_NONBLOCK) < 0) {
         perror("Out pipe creation failed");
         return -1;
     }
+
+    fcntl(client->out_pipe.out, F_SETPIPE_SZ, CLIENT_BUFFER_SIZE);
 
     client->in_pipe_size = client->out_pipe_size = 0;
 
