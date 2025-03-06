@@ -231,11 +231,8 @@ static int client_ctx_on_remote_hup(struct ClientContext* client) {
         return 0;
     }
 
-    const size_t buffer_size = client->in_pipe_size;
-
     // Still need to send the rest of the data
-    if (buffer_size > 0) {
-        printf("BUFFER SIZE IS %zu\n", buffer_size);
+    if (client->in_pipe_size > 0) {
         client->state = CLIENT_STATE_DISCONNECTING;
         return 0;
     }
@@ -867,6 +864,8 @@ static int client_ctx_on_remote_recv(struct ClientContext* client) {
 static int client_ctx_on_send(struct ClientContext* client) {
     if (client->in_pipe_size > 0) {
         const ssize_t sent = client_ctx_splice_remote_out(client);
+        if (sent < 0)
+            return -1;
 
         if (sent > 0)
             client->interests |= EPOLLOUT;
@@ -896,6 +895,8 @@ static int client_ctx_on_remote_send(struct ClientContext* client) {
     if (LIKELY(client->state == CLIENT_STATE_STREAMING)) {
         if (client->out_pipe_size > 0) {
             const ssize_t sent = client_ctx_splice_out(client);
+            if (sent < 0)
+                return -1;
 
             if (sent > 0)
                 client->interests |= EPOLLIN;
