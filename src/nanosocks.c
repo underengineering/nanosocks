@@ -54,14 +54,26 @@ struct SharedClientContext {
 };
 
 struct ClientContext {
-    struct SharedClientContext*   shared_ctx;
+    struct SharedClientContext* shared_ctx;
 
-    enum ClientState              state;
+    enum ClientState            state;
 
-    int                           in_pipe[2];
-    size_t                        in_pipe_size;
+    union {
+        int arr[2];
+        struct {
+            int out;
+            int in;
+        };
+    } in_pipe;
+    size_t in_pipe_size;
 
-    int                           out_pipe[2];
+    union {
+        int arr[2];
+        struct {
+            int out;
+            int in;
+        };
+    } out_pipe;
     size_t                        out_pipe_size;
 
     struct sockaddr_in            sin;
@@ -161,7 +173,7 @@ static void client_ctx_get_remote_address(struct ClientContext* client,
 
 static int client_ctx_write_in_queue(struct ClientContext* client,
                                      const void* data, size_t size) {
-    const ssize_t sent = write(client->in_pipe[1], data, size);
+    const ssize_t sent = write(client->in_pipe.in, data, size);
     if (sent < 0) {
         perror("Write failed");
         return -1;
@@ -239,15 +251,15 @@ static void client_ctx_free(struct ClientContext* client) {
     if (client->remote_poll_data != NULL)
         free(list_node_from_data(client->remote_poll_data));
 
-    close(client->in_pipe[0]);
-    close(client->in_pipe[1]);
-    close(client->out_pipe[0]);
-    close(client->out_pipe[1]);
+    close(client->in_pipe.out);
+    close(client->in_pipe.in);
+    close(client->out_pipe.out);
+    close(client->out_pipe.in);
 }
 
 static int client_ctx_splice_in(struct ClientContext* client) {
     const ssize_t read =
-        splice(client->sock, NULL, client->out_pipe[1], NULL,
+        splice(client->sock, NULL, client->out_pipe.in, NULL,
                CLIENT_BUFFER_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (read < 0) {
         if (errno != EAGAIN) {
@@ -293,7 +305,7 @@ static int client_ctx_splice_in(struct ClientContext* client) {
 
 static ssize_t client_ctx_splice_out(struct ClientContext* client) {
     const ssize_t sent =
-        splice(client->out_pipe[0], NULL, client->remote_sock, NULL,
+        splice(client->out_pipe.out, NULL, client->remote_sock, NULL,
                client->out_pipe_size, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (sent < 0) {
         if (errno != EAGAIN) {
@@ -774,7 +786,7 @@ static int client_ctx_on_recv(struct ClientContext* client, int epoll_fd,
 
 static int client_ctx_splice_remote_in(struct ClientContext* client) {
     const ssize_t read =
-        splice(client->remote_sock, NULL, client->in_pipe[1], NULL,
+        splice(client->remote_sock, NULL, client->in_pipe.in, NULL,
                CLIENT_BUFFER_SIZE, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (read < 0) {
         if (errno != EAGAIN) {
@@ -817,7 +829,7 @@ static int client_ctx_splice_remote_in(struct ClientContext* client) {
 
 static ssize_t client_ctx_splice_remote_out(struct ClientContext* client) {
     const ssize_t sent =
-        splice(client->in_pipe[0], NULL, client->sock, NULL,
+        splice(client->in_pipe.out, NULL, client->sock, NULL,
                client->in_pipe_size, SPLICE_F_MOVE | SPLICE_F_NONBLOCK);
     if (sent < 0) {
         if (errno != EAGAIN) {
