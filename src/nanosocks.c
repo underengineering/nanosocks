@@ -18,7 +18,10 @@
 #include <sys/signalfd.h>
 #include <unistd.h>
 
-#include "nanosocks.h"
+#include <ares.h>
+
+#include "protocol.h"
+#include "util.h"
 
 static const size_t CLIENT_BUFFER_SIZE = 0xffff;
 
@@ -29,7 +32,7 @@ enum LogLevel {
     LOG_LEVEL_DEBUG   = 3,
 };
 
-static const enum LogLevel LOG_LEVEL = LOG_LEVEL_INFO;
+static const enum LogLevel LOG_LEVEL = LOG_LEVEL_DEBUG;
 
 struct AuthenticationContext {
     char* username;
@@ -45,7 +48,14 @@ enum ClientState {
     CLIENT_STATE_DISCONNECTING
 };
 
+struct SharedClientContext {
+    int             epoll_fd;
+    ares_channel_t* ares_channel;
+};
+
 struct ClientContext {
+    struct SharedClientContext*   shared_ctx;
+
     enum ClientState              state;
 
     int                           in_pipe[2];
@@ -74,9 +84,12 @@ struct ClientContextPollData {
     int                   events;
 };
 
-static int client_ctx_init(struct ClientContext* client) {
-    client->state = CLIENT_STATE_WAIT_GREET;
+static int client_ctx_init(struct ClientContext* client, int sock,
+                           struct SharedClientContext* shared_ctx) {
+    client->shared_ctx = shared_ctx;
+    client->state      = CLIENT_STATE_WAIT_GREET;
 
+    client->sock        = sock;
     client->remote_sock = INVALID_SOCKFD;
 
     if (pipe((int*)&client->in_pipe) < 0) {
@@ -213,42 +226,6 @@ static int client_ctx_on_remote_hup(struct ClientContext* client) {
 
     return -1;
 }
-
-enum Socks5AuthMethod {
-    AUTH_METHOD_NO_AUTH   = 0x00,
-    AUTH_METHOD_USER_PASS = 0x02,
-};
-
-enum Socks5Command {
-    SOCKS5_CMD_TCP_STREAM = 0x01,
-    SOCKS5_CMD_TCP_ASSOC  = 0x02,
-    SOCKS5_CMD_UDP_ASSOC  = 0x03
-};
-
-enum Socks5AddressType {
-    SOCKS5_ADDR_IPV4   = 0x01,
-    SOCKS5_ADDR_DOMAIN = 0x03,
-    SOCKS5_ADDR_IPV6   = 0x04,
-};
-
-enum Socks5Status {
-    SOCKS5_STATUS_REQUEST_GRANTED        = 0x00,
-    SOCKS5_STATUS_GENERAL_FAILURE        = 0x01,
-    SOCKS5_STATUS_CONNECTION_NOT_ALLOWED = 0x02,
-    SOCKS5_STATUS_NETWORK_UNREACHABLE    = 0x03,
-    SOCKS5_STATUS_HOST_UNREACHABLE       = 0x04,
-    SOCKS5_STATUS_CONNECTION_REFUSED     = 0x05,
-    SOCKS5_STATUS_TTL_EXPIRED            = 0x06,
-    SOCKS5_STATUS_COMMAND_NOT_SUPPORTED  = 0x07,
-    SOCKS5_STATUS_ADDRESS_NOT_SUPPORTED  = 0x08,
-};
-
-struct Socks5ConnRequestHeader {
-    uint8_t version;
-    uint8_t command;
-    uint8_t reserved;
-    uint8_t address_type;
-};
 
 static void client_ctx_free(struct ClientContext* client) {
     // Close sockets
@@ -536,6 +513,114 @@ static int client_ctx_auth(struct ClientContext*         client,
     return 0;
 }
 
+static int client_ctx_setup_connection(struct ClientContext* client,
+                                       int                   epoll_fd) {
+    if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
+        char address[64];
+        client_ctx_get_address(client, address, sizeof(address));
+
+        char remote_address_str[64];
+        client_ctx_get_remote_address(client, remote_address_str,
+                                      sizeof(remote_address_str));
+
+        printf("%-21s [%-13s]: Connecting to %s\n", address,
+               client_ctx_state(client), remote_address_str);
+    }
+
+    const int remote_sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (remote_sock < 0) {
+        perror("Failed to create a remote socket");
+        return -1;
+    }
+
+    const int status =
+        connect(remote_sock, (const struct sockaddr*)&client->remote_sin,
+                sizeof(client->remote_sin));
+    if (status < 0 && errno != EINPROGRESS && errno != EAGAIN) {
+        perror("Connect failed");
+        close(remote_sock);
+        return -1;
+    }
+
+    // Disable nagle algorithm
+    if (setsockopt(remote_sock, IPPROTO_TCP, TCP_NODELAY, &(int){1},
+                   sizeof(int)) < 0) {
+        perror("setsockopt TCP_NODELAY");
+        close(remote_sock);
+        return -1;
+    }
+
+    struct ClientContextPollData* const poll_data = client->remote_poll_data;
+
+    // EPOLLOUT should be on until connection is made
+    struct epoll_event event;
+    event.events   = EPOLLIN | EPOLLOUT | EPOLLET;
+    event.data.ptr = poll_data;
+
+    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, remote_sock, &event) < 0) {
+        perror("epoll_ctl failed");
+        close(remote_sock);
+        return -1;
+    }
+
+    client->remote_sock = remote_sock;
+
+    client->interests        = 0;
+    client->remote_interests = EPOLLOUT;
+
+    client->state = CLIENT_STATE_WAIT_CONNECT;
+
+    return 0;
+}
+
+static void client_ctx_ares_callback(void* arg, int status, int timeouts,
+                                     struct ares_addrinfo* result) {
+    (void)status;
+    (void)timeouts;
+
+    struct ClientContext* const      client = arg;
+
+    const struct ares_addrinfo_node* info = NULL;
+    for (info = result->nodes; info != NULL; info = info->ai_next) {
+        if (info->ai_family == AF_INET) {
+            break;
+        }
+    }
+
+    if (info == NULL) {
+        // No available address found
+        char response[4 + 4 + 2];
+        response[0]                  = 0x05;                          //ver
+        response[1]                  = SOCKS5_STATUS_GENERAL_FAILURE; //status
+        response[2]                  = 0x00;                          //rsv
+        response[3]                  = 0x01;                          //ipv4
+        *(uint32_t*)&response[4]     = 0;                             //addr
+        *(uint16_t*)&response[4 + 4] = 0;                             //port
+        client_ctx_write_in_queue(client, response, sizeof(response));
+
+        client->interests = EPOLLOUT;
+        client->state     = CLIENT_STATE_DISCONNECTING;
+
+        if (LOG_LEVEL >= LOG_LEVEL_INFO) {
+            char address[64];
+            client_ctx_get_address(client, address, sizeof(address));
+
+            printf("%-21s [%-13s]: Failed to resolve %s\n", address,
+                   client_ctx_state(client), result->name);
+        }
+
+        ares_freeaddrinfo(result);
+        return;
+    }
+
+    const struct sockaddr_in* const sin = (struct sockaddr_in*)info->ai_addr;
+    client->remote_sin.sin_family       = sin->sin_family;
+    client->remote_sin.sin_addr         = sin->sin_addr;
+    ares_freeaddrinfo(result);
+
+    client_ctx_setup_connection(client, client->shared_ctx->epoll_fd);
+}
+
 static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
     char    buffer[512];
     ssize_t read;
@@ -610,6 +695,10 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
         offset += 4;
 
         remote_port = *(uint16_t*)&buffer[offset];
+
+        client->remote_sin.sin_family      = AF_INET;
+        client->remote_sin.sin_addr.s_addr = remote_address;
+        client->remote_sin.sin_port        = htons(remote_port);
     } else if (address_type == SOCKS5_ADDR_DOMAIN) {
         required_size += 1 + 2;
         if (read < required_size) {
@@ -638,115 +727,23 @@ static int client_ctx_on_request(struct ClientContext* client, int epoll_fd) {
             printf("%-21s [%-13s]: Resolving domain %s\n", address,
                    client_ctx_state(client), domain);
 
-        // Resolve ipv4
-        struct addrinfo* addr_info = NULL;
-        if (getaddrinfo(domain, NULL, NULL, &addr_info) < 0) {
-            char response[4 + 4 + 2];
-            response[0]              = 0x05;                          //ver
-            response[1]              = SOCKS5_STATUS_GENERAL_FAILURE; //status
-            response[2]              = 0x00;                          //rsv
-            response[3]              = 0x01;                          //ipv4
-            *(uint32_t*)&response[4] = remote_address;                //addr
-            *(uint16_t*)&response[4 + 4] = htons(remote_port);        //port
-            client_ctx_write_in_queue(client, response, sizeof(response));
+        client->remote_sin.sin_port = remote_port;
 
-            client->interests = EPOLLOUT;
-            client->state     = CLIENT_STATE_DISCONNECTING;
+        client->interests        = 0;
+        client->remote_interests = 0;
 
-            perror("getaddrinfo failed");
-            return 0;
-        }
+        // Resolve the domain
+        struct ares_addrinfo_hints hints;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_flags  = ARES_AI_CANONNAME;
+        ares_getaddrinfo(client->shared_ctx->ares_channel, domain, NULL, &hints,
+                         client_ctx_ares_callback, client);
 
-        for (struct addrinfo* info = addr_info; info != NULL;
-             info                  = info->ai_next) {
-            if (info->ai_family == AF_INET) {
-                struct sockaddr_in* sin = (struct sockaddr_in*)info->ai_addr;
-                remote_address          = sin->sin_addr.s_addr;
-                break;
-            }
-        }
-
-        freeaddrinfo(addr_info);
-
-        if (remote_address == 0) {
-            // No available address found
-            char response[4 + 4 + 2];
-            response[0]              = 0x05;                          //ver
-            response[1]              = SOCKS5_STATUS_GENERAL_FAILURE; //status
-            response[2]              = 0x00;                          //rsv
-            response[3]              = 0x01;                          //ipv4
-            *(uint32_t*)&response[4] = remote_address;                //addr
-            *(uint16_t*)&response[4 + 4] = htons(remote_port);        //port
-            client_ctx_write_in_queue(client, response, sizeof(response));
-
-            client->interests = EPOLLOUT;
-            client->state     = CLIENT_STATE_DISCONNECTING;
-
-            if (LOG_LEVEL >= LOG_LEVEL_INFO)
-                printf("%-21s [%-13s]: Failed to resolve %s\n", address,
-                       client_ctx_state(client), domain);
-
-            return 0;
-        }
+        return 0;
     }
 
-    client->remote_sin.sin_family      = AF_INET;
-    client->remote_sin.sin_addr.s_addr = remote_address;
-    client->remote_sin.sin_port        = remote_port;
-
-    if (LOG_LEVEL >= LOG_LEVEL_DEBUG) {
-        char remote_address_str[64];
-        client_ctx_get_remote_address(client, remote_address_str,
-                                      sizeof(remote_address_str));
-
-        printf("%-21s [%-13s]: Connecting to %s\n", address,
-               client_ctx_state(client), remote_address_str);
-    }
-
-    const int remote_sock = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
-    if (remote_sock < 0) {
-        perror("Failed to create a remote socket");
-        return -1;
-    }
-
-    const int status =
-        connect(remote_sock, (const struct sockaddr*)&client->remote_sin,
-                sizeof(client->remote_sin));
-    if (status < 0 && errno != EINPROGRESS && errno != EAGAIN) {
-        perror("Connect failed");
-        close(remote_sock);
-        return -1;
-    }
-
-    // Disable nagle algorithm
-    if (setsockopt(remote_sock, IPPROTO_TCP, TCP_NODELAY, &(int){1},
-                   sizeof(int)) < 0) {
-        perror("setsockopt TCP_NODELAY");
-        close(remote_sock);
-        return -1;
-    }
-
-    struct ClientContextPollData* const poll_data = client->remote_poll_data;
-
-    // EPOLLOUT should be on until connection is made
-    struct epoll_event event;
-    event.events   = EPOLLIN | EPOLLOUT | EPOLLET;
-    event.data.ptr = poll_data;
-
-    if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, remote_sock, &event) < 0) {
-        perror("epoll_ctl failed");
-        close(remote_sock);
-        return -1;
-    }
-
-    client->remote_sock = remote_sock;
-
-    client->interests        = 0;
-    client->remote_interests = EPOLLOUT;
-
-    client->state = CLIENT_STATE_WAIT_CONNECT;
-
-    return 0;
+    return client_ctx_setup_connection(client, epoll_fd);
 }
 
 static int client_ctx_stream(struct ClientContext* client) {
@@ -931,18 +928,22 @@ static int client_ctx_on_remote_send(struct ClientContext* client) {
 }
 
 struct ServerContext {
-    int         server_sock;
-    int         events;
+    struct SharedClientContext shared_ctx;
 
-    int         epoll_fd;
+    int                        epoll_fd;
 
-    struct List clients;
-    struct List poll_data_list;
-    struct List ready_clients;
-    size_t      ready_clients_count;
+    int                        server_sock;
+    int                        events;
+
+    struct List                clients;
+    struct List                poll_data_list;
+    struct List                ready_clients;
+    size_t                     ready_clients_count;
 };
 
-static int server_ctx_init(struct ServerContext* server, uint16_t port) {
+static int server_ctx_init(struct ServerContext* server, uint16_t port,
+                           ares_channel_t* ares_channel) {
+
     const int server_sock = server->server_sock =
         socket(AF_INET, SOCK_STREAM | O_NONBLOCK, 0);
     if (server_sock < 0) {
@@ -995,6 +996,9 @@ static int server_ctx_init(struct ServerContext* server, uint16_t port) {
         perror("epoll_ctl failed");
         goto failure_epoll;
     }
+
+    server->shared_ctx.epoll_fd     = epoll_fd;
+    server->shared_ctx.ares_channel = ares_channel;
 
     return 0;
 
@@ -1054,12 +1058,11 @@ static int server_ctx_accept(struct ServerContext* server) {
     list_append(&server->clients, client_node);
 
     struct ClientContext* const client = list_node_data(client_node);
-    if (client_ctx_init(client) < 0) {
+    if (client_ctx_init(client, client_sock, &server->shared_ctx) < 0) {
         perror("Client initialization failed");
         goto failure_client_alloc;
     }
 
-    client->sock = client_sock;
     memcpy(&client->sin, &sin, sizeof(sin));
 
     // Make it non-blocking
@@ -1094,7 +1097,6 @@ static int server_ctx_accept(struct ServerContext* server) {
         &server->poll_data_list, sizeof(struct ClientContextPollData));
     if (remote_epoll_data_node == NULL) {
         perror("Failed to allocate a ClientContextPollData node");
-        close(client_sock);
         goto failure_client_alloc;
     }
 
@@ -1114,7 +1116,6 @@ static int server_ctx_accept(struct ServerContext* server) {
         &server->poll_data_list, sizeof(struct ClientContextPollData));
     if (epoll_data_node == NULL) {
         perror("Failed to allocate a ClientContextPollData node");
-        close(client_sock);
         goto failure_remote_epoll_data;
     }
 
@@ -1272,8 +1273,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Initialize c-ares
+    ares_channel_t* ares_channel = NULL;
+    if (ares_library_init(ARES_LIB_INIT_ALL) != ARES_SUCCESS) {
+        fprintf(stderr, "c-ares library initialization failed\n");
+        return 1;
+    }
+
+    if (!ares_threadsafety()) {
+        fprintf(stderr, "c-ares not compiled with thread support\n");
+        return 1;
+    }
+
+    struct ares_options options;
+    memset(&options, 0, sizeof(options));
+    options.evsys = ARES_EVSYS_DEFAULT;
+    if (ares_init_options(&ares_channel, &options, ARES_OPT_EVENT_THREAD) !=
+        ARES_SUCCESS) {
+        fprintf(stderr, "c-ares initialization failed\n");
+        return 1;
+    }
+
     struct ServerContext server;
-    if (server_ctx_init(&server, server_port) < 0)
+    if (server_ctx_init(&server, server_port, ares_channel) < 0)
         return 1;
 
     // Setup signal handlers
@@ -1444,12 +1466,18 @@ int main(int argc, char* argv[]) {
     if (LOG_LEVEL >= LOG_LEVEL_INFO)
         printf("Cleaning up\n");
 
+    // Wait for requests to be completed before freeing clients
+    ares_queue_wait_empty(ares_channel, -1);
+
     server_ctx_free(&server);
 
     if (auth_ctx.username != NULL && auth_ctx.password != NULL) {
         free(auth_ctx.username);
         free(auth_ctx.password);
     }
+
+    ares_destroy(ares_channel);
+    ares_library_cleanup();
 
     if (LOG_LEVEL >= LOG_LEVEL_DEBUG)
         printf("Exiting\n");

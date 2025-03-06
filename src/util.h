@@ -1,3 +1,6 @@
+#ifndef NANOSOCKS_UTIL_H
+#define NANOSOCKS_UTIL_H
+
 #include <errno.h>
 #include <netinet/in.h>
 #include <poll.h>
@@ -112,3 +115,5 @@ static void list_remove(struct List* list, struct ListNode* node) {
 
     node->prev = node->next = NULL;
 }
+
+#endif
