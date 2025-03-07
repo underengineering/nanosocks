@@ -18,42 +18,6 @@
 static const int    INVALID_SOCKFD = -1;
 static const size_t INVALID_POLLFD = (size_t)-1;
 
-static ssize_t      recv_all(int sock, void* buffer, size_t size, int flags) {
-    ssize_t read_total = 0;
-    do {
-        ssize_t read =
-            recv(sock, (char*)buffer + read_total, size - read_total, flags);
-        if (read <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-
-            return read;
-        }
-
-        read_total += read;
-    } while ((size_t)read_total < size);
-
-    return read_total;
-}
-
-static ssize_t send_all(int sock, const void* buffer, size_t size, int flags) {
-    ssize_t sent_total = 0;
-    do {
-        ssize_t sent = send(sock, (const char*)buffer + sent_total,
-                            size - sent_total, flags);
-        if (sent <= 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
-                break;
-
-            return sent;
-        }
-
-        sent_total += sent;
-    } while ((size_t)sent_total < size);
-
-    return sent_total;
-}
-
 struct ListNode {
     struct ListNode* next;
     struct ListNode* prev;
