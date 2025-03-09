@@ -1,4 +1,5 @@
 CC = gcc
+LD = gcc
 CFLAGS ?= -O3
 LDFLAGS ?=
 
@@ -11,7 +12,8 @@ CARES_INSTALL_DIR = $(BUILD_DIR)/cares-install
 CARES_TARBALL = $(CARES_BUILD_DIR).tar.gz
 CARES_URL = https://github.com/c-ares/c-ares/releases/download/v$(CARES_VERSION)/c-ares-$(CARES_VERSION).tar.gz
 
-DEPENDENCIES = src/nanosocks.c src/protocol.h src/util.h
+HEADERS = $(addprefix src/, client.h list.h log.h protocol.h server.h util.h)
+OBJECTS = $(addprefix $(BUILD_DIR)/, client.o nanosocks.o server.o)
 ifeq ($(USE_SYSTEM_CARES),1)
 	LDFLAGS += -lcares
 else
@@ -21,9 +23,12 @@ else
 endif
 
 .PHONY: all
-all: $(DEPENDENCIES)
-	mkdir -p $(BUILD_DIR)
-	$(CC) $(CFLAGS) -std=c99 src/nanosocks.c $(LDFLAGS) -o $(BUILD_DIR)/nanosocks
+all: $(OBJECTS)
+	$(LD) $(LDFLAGS) $^ -o $(BUILD_DIR)/nanosocks
+
+$(OBJECTS): $(BUILD_DIR)/%.o: src/%.c $(HEADERS)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(CFLAGS) -std=c99 -D_GNU_SOURCE -c $< -o $@
 
 $(CARES_INSTALL_DIR)/lib/libcares.a: $(CARES_TARBALL)
 	@echo "Building c-ares $(CARES_VERSION)..."
